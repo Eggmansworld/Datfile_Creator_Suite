@@ -1,2 +1,651 @@
-# datfile_creator
-A bulk datfile generation tool for RomVault, built for collectors who manage large, structured archives and need consistent, reproducible DAT files across hundreds or thousands of folders.
+# Eggman's Datfile Creator
+
+A bulk datfile generation tool for **RomVault**, built for collectors who manage large, structured archives and need consistent, reproducible DAT files across hundreds or thousands of folders.
+
+Produces **Logiqx XML** datfiles compatible with RomVault, ClrMamePro, and RomCenter. Supports both **Mixed (Archive as File)** and **Zipped** collection types, with four structure options that replicate the datfile output styles that RomVault natively supports.
+
+---
+
+If this tool saves you time, consider supporting the work:
+
+<a href="https://buymeacoffee.com/eggmansworld">
+  <img src="https://cdn.buymeacoffee.com/buttons/v2/default-orange.png" height="45" alt="Buy Me a Coffee">
+</a>
+
+---
+
+## Table of Contents
+
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Interface Overview](#interface-overview)
+  - [Paths](#paths)
+  - [DAT Header Fields](#dat-header-fields)
+  - [Options](#options)
+- [Dat Types](#dat-types)
+  - [Mixed — Archive as File](#mixed--archive-as-file)
+  - [Zipped](#zipped)
+- [Generation Modes](#generation-modes)
+  - [1 Dat per Root Folder](#1-dat-per-root-folder)
+  - [1 Dat per Root Folder and All Subfolders](#1-dat-per-root-folder-and-all-subfolders)
+- [Structure Options](#structure-options)
+  - [Structure 1 — Dirs](#structure-1--dirs)
+  - [Structure 2 — Archives as Games](#structure-2--archives-as-games)
+  - [Structure 3 — First Level Dirs as Games](#structure-3--first-level-dirs-as-games)
+  - [Structure 4 — First Level Dirs as Games + Merge Dirs in Games](#structure-4--first-level-dirs-as-games--merge-dirs-in-games)
+- [Format: Modern vs Legacy](#format-modern-vs-legacy)
+- [Hash Options](#hash-options)
+- [Extension Filters](#extension-filters)
+- [7-Zip ZStandard Support](#7-zip-zstandard-support)
+- [Parent Name and Output Folder Structure](#parent-name-and-output-folder-structure)
+- [Dat Preview Window](#dat-preview-window)
+- [Settings and Config File](#settings-and-config-file)
+- [Advanced: Datfile Landscape Analysis](#advanced-datfile-landscape-analysis)
+- [Advanced: DAT Format Reference](#advanced-dat-format-reference)
+- [Known Limitations](#known-limitations)
+- [License](#license)
+
+---
+
+## Requirements
+
+- **Python 3.10+**
+- **[7-Zip-ZStandard](https://github.com/mcmilk/7-Zip-zstd/releases)** — required for all zip analysis (Mixed and Zipped modes). Default install path: `C:\Program Files\7-Zip-Zstandard\7z.exe`
+- **tkinterdnd2** — for drag-and-drop support
+
+```
+pip install tkinterdnd2
+```
+
+---
+
+## Installation
+
+1. Install Python 3.10 or later from [python.org](https://python.org)
+2. Install 7-Zip-ZStandard from the link above
+3. Install tkinterdnd2:
+   ```
+   pip install tkinterdnd2
+   ```
+4. Download `Eggmans_Datfile_Creator.py` and place it anywhere convenient
+5. Run it:
+   ```
+   python Eggmans_Datfile_Creator.py
+   ```
+
+The script saves its config file (`Eggmans_Datfile_Creator_config.json`) in the same directory as the script itself.
+
+---
+
+## Quick Start
+
+1. Set your **Input top-level folder** — the folder that contains the game folders you want to dat
+2. Set your **Output folder** — where the datfiles will be written (mirrors input folder structure)
+3. Fill in at minimum a **Description** in the header section
+4. Choose **Dat Type**: Mixed or Zipped
+5. Choose **Generation**: 1 Dat per root folder (most common)
+6. Choose **Structure**: Structure 2 is the right choice for the majority of collections
+7. Choose **Format**: Modern
+8. Click **Start**
+
+---
+
+## Interface Overview
+
+### Paths
+
+| Field | Purpose |
+|---|---|
+| **Input top-level folder** | The folder whose immediate subfolders become individual dat jobs |
+| **Output folder (dat root)** | Root of the output structure. Datfiles are written into subfolders that mirror the input |
+| **Parent name (optional prefix)** | Prepended to every dat name: `Parent - TopLevel - Subfolder` |
+| **7-Zip-ZStandard (7z.exe)** | Full path to `7z.exe` from the 7-Zip-ZStandard release |
+
+### DAT Header Fields
+
+These map directly to the `<header>` block in the output datfile. All fields except **Description** are optional — blank fields will write empty tags, which is valid and expected in Logiqx XML.
+
+| Field | Header tag | Notes |
+|---|---|---|
+| Description | `<description>` | Free text. Typically matches the collection name |
+| Category | `<category>` | e.g. `PC`, `Arcade`, `Commodore` |
+| Version | `<version>` | Release version or date stamp |
+| Date | `<date>` | Defaults to today's date at runtime |
+| Author | `<author>` | Your name or handle |
+| URL | `<url>` | Project or source URL |
+| Homepage | `<homepage>` | Homepage URL |
+| Comment | `<comment>` | Free text notes |
+
+The `<name>` tag is populated automatically from the dat filename stem. Every dat also receives `<romvault/>` as the last header tag — this is the base RomVault recognition token, and expands to `<romvault forcepacking="fileonly"/>` when Mixed mode is active.
+
+### Options
+
+All options are described in detail in their own sections below. The UI greys out options that do not apply to the current combination of Dat Type and Generation mode — this prevents invalid combinations without hiding the controls.
+
+---
+
+## Dat Types
+
+### Mixed — Archive as File
+
+The file **itself** is the ROM entry. The zip, 7z, or any other archive file is hashed as a single opaque file — its contents are not inspected.
+
+Use this when RomVault is managing archives as **atomic units** — each archive is one logical game entry in your collection, and RomVault will not look inside it.
+
+```xml
+<game name="Lemmings (1991) (Psygnosis) [360K]">
+    <description>Lemmings (1991) (Psygnosis) [360K]</description>
+    <rom name="Lemmings (1991) (Psygnosis) [360K].zip"
+         size="1423168" crc="a3f82b1c" sha1="d4e9c02a7f1b3e5d8c6a0f4b2e7d1a9c3f5b8e2d"/>
+</game>
+```
+
+The header always contains `<romvault forcepacking="fileonly"/>`, which instructs RomVault to treat every matched file as a file-only entry regardless of extension.
+
+**When to use Mixed:**
+- PC floppy/CD image collections where each game is a discrete archive
+- Any collection where the archive boundary is the logical game boundary
+- Collections managed as scene-style releases where the zip is the delivery unit
+
+### Zipped
+
+The **contents** of each zip archive are hashed. Each zip becomes a game entry, and each file inside the zip becomes a `<rom>` entry within that game.
+
+Use this when RomVault is expected to open, verify, and manage individual files within archives — the standard mode for ROM sets from No-Intro, Redump, TOSEC, and similar databases.
+
+```xml
+<game name="Lemmings (1991) (Psygnosis) [360K]">
+    <description>Lemmings (1991) (Psygnosis) [360K]</description>
+    <rom name="Disk 1.ima" size="368640" crc="3a9f12b4"
+         sha1="e2c8a4f1b9d3e7c5a2f8b4d0e6c2a8f4b6d2e8c4"/>
+    <rom name="Disk 2.ima" size="368640" crc="7b2e45c1"
+         sha1="f3d9b5e2c1a4f8b6d2e0c6a3f9b5e1c7a3f9b5e1"/>
+</game>
+```
+
+Internally zipped subfolders are always preserved in the rom name:
+
+```xml
+<rom name="original/Lemmings (1991) (Psygnosis) [360K] (Disk B).ima"
+     size="368640" crc="9c4a21d7" sha1="..."/>
+```
+
+> **ZStandard note:** Archives compressed with RV-ZStandard (zip comment beginning `RVZSTD-`) or TorrentZip cannot be read by Python's built-in zipfile module. This tool uses 7-Zip-ZStandard exclusively for all zip analysis to ensure every compression method is handled correctly.
+
+---
+
+## Generation Modes
+
+### 1 Dat per Root Folder
+
+Each immediate subfolder of the input root becomes **one datfile**. All content within that subfolder — regardless of depth — is rolled into the single dat.
+
+Given this input:
+```
+E:\Floppy\Access Software\
+    Amazon (1992)\
+        amazon.zip
+        Docs\
+            amazon_manual.zip
+    Crime Wave (1990)\
+        crime_wave.zip
+```
+
+The tool produces:
+```
+Output\Access Software\
+    Parent - Floppy - Amazon (1992) (2026-04-24_RomVault).xml
+    Parent - Floppy - Crime Wave (1990) (2026-04-24_RomVault).xml
+```
+
+The content of `Docs\` within `Amazon (1992)\` is captured inside the Amazon dat — how it appears depends on the chosen **Structure** option.
+
+Use this mode when each top-level subfolder represents a single logical unit (one game title, one publisher, one platform).
+
+### 1 Dat per Root Folder and All Subfolders
+
+Every folder at every depth that contains relevant content gets its own datfile. The output folder structure mirrors the input exactly.
+
+Given the same input above, this mode produces a separate dat for the `Docs` subfolder as well:
+
+```
+Output\Access Software\
+    Parent - Floppy - Amazon (1992) (2026-04-24_RomVault).xml       ← amazon.zip only
+    Parent - Floppy - Crime Wave (1990) (2026-04-24_RomVault).xml
+    Amazon (1992)\Docs\
+        Parent - Floppy - Amazon (1992) - Docs (2026-04-24_RomVault).xml
+```
+
+Each dat contains only the content sitting directly in that specific folder — no recursive capture.
+
+Use this mode for large heterogeneous collections where subfolders are logically independent (different platforms, publishers, or release types sharing a common input root).
+
+---
+
+## Structure Options
+
+Structure controls how the internal hierarchy of a datfile is expressed. It only applies to **1 Dat per Root Folder** mode — in Per All mode every dat is flat by definition.
+
+The four structures replicate the output options from RomVault's dir2datUI tool. Use the **Preview window** to compare them side-by-side against your actual data before committing to a structure.
+
+### Reference Folder Layout
+
+All four examples below use this input:
+
+```
+Access Software PC Floppy Disk Image Collection\
+    Crime Wave (1990)\                    ← folder with direct archives
+        Crime Wave (1990) (Disk A).zip
+        Crime Wave (1990) (Disk B).zip
+        original\                         ← physical subfolder inside game folder
+            Crime Wave (1990) (v1.0).zip
+    Docs\                                 ← container folder, no direct archives
+        Amazon Docs\
+            Amazon - Manual.zip
+        Crime Wave Docs\
+            Crime Wave - Manual.zip
+```
+
+---
+
+### Structure 1 — Dirs
+
+Every folder at every depth becomes a `<dir>` tag. No `<game>` tags are used anywhere. Archives become `<dir>` entries containing their rom entries.
+
+```xml
+<dir name="Crime Wave (1990)">
+    <dir name="Crime Wave (1990) (Disk A)">
+        <rom name="Crime Wave (1990) (Disk A).ima" size="368640" crc="3a9f12b4" sha1="..."/>
+    </dir>
+    <dir name="Crime Wave (1990) (Disk B)">
+        <rom name="Crime Wave (1990) (Disk B).ima" .../>
+    </dir>
+    <dir name="original">
+        <dir name="Crime Wave (1990) (v1.0)">
+            <rom name="Crime Wave (1990) (v1.0).ima" .../>
+        </dir>
+    </dir>
+</dir>
+<dir name="Docs">
+    <dir name="Amazon Docs">
+        <dir name="Amazon - Manual">
+            <rom name="Amazon - Manual.pdf" .../>
+        </dir>
+    </dir>
+    ...
+</dir>
+```
+
+**Use when:** Maximum structural compatibility is needed, or when your collection management tool treats all folder levels equivalently. Least common in practice — represents 0% of the 10,497 datfiles surveyed in a real-world collection of this scale.
+
+---
+
+### Structure 2 — Archives as Games
+
+Archives become `<game>` entries. Physical filesystem folders become `<dir>` entries. Files inside archives that live in internal subfolders have their path preserved in the rom `name` attribute.
+
+This is the **default and most widely used structure**. It matches the output format of No-Intro, Redump, TOSEC, and the majority of community-distributed dat files.
+
+```xml
+<game name="Crime Wave (1990) (Disk A)">
+    <description>Crime Wave (1990) (Disk A)</description>
+    <rom name="Crime Wave (1990) (Disk A).ima" size="368640" crc="3a9f12b4" sha1="..."/>
+</game>
+<game name="Crime Wave (1990) (Disk B)">
+    <description>Crime Wave (1990) (Disk B)</description>
+    <rom name="Crime Wave (1990) (Disk B).ima" .../>
+</game>
+<dir name="original">
+    <game name="Crime Wave (1990) (v1.0)">
+        <description>Crime Wave (1990) (v1.0)</description>
+        <rom name="Crime Wave (1990) (v1.0).ima" .../>
+    </game>
+</dir>
+<dir name="Docs">
+    <dir name="Amazon Docs">
+        <game name="Amazon - Manual">
+            <description>Amazon - Manual</description>
+            <rom name="Amazon - Manual.pdf" .../>
+        </game>
+    </dir>
+    <dir name="Crime Wave Docs">
+        <game name="Crime Wave - Manual">
+            ...
+        </game>
+    </dir>
+</dir>
+```
+
+**Use when:** Your collection uses standard zip-per-game organisation, with physical subfolders representing logical groupings (disc variants, regional versions, documentation).
+
+> This structure represents **68.8% of all datfiles** in a survey of 10,497 dats across two large RomVault-managed collections (see [Advanced: Datfile Landscape Analysis](#advanced-datfile-landscape-analysis)).
+
+---
+
+### Structure 3 — First Level Dirs as Games
+
+The first level of physical subfolders inside the dat root are always rendered as `<game>` entries, regardless of whether they contain archives directly or act as containers. Deeper physical subfolders become `<dir>` entries.
+
+```xml
+<game name="Crime Wave (1990)">
+    <description>Crime Wave (1990)</description>
+    <rom name="Crime Wave (1990) (Disk A).ima" .../>      ← direct archives merged in
+    <rom name="Crime Wave (1990) (Disk B).ima" .../>
+    <rom name="original/Crime Wave (1990) (v1.0).ima" .../> ← internal subdir path preserved
+</game>
+<game name="Docs">
+    <description>Docs</description>
+    <dir name="Amazon Docs">
+        <game name="Amazon - Manual">
+            <rom name="Amazon - Manual.pdf" .../>
+        </game>
+    </dir>
+    <dir name="Crime Wave Docs">
+        ...
+    </dir>
+</game>
+```
+
+**Use when:** Each first-level subfolder represents a complete game or release, and you want the folder itself — not its individual archives — to be the primary named entry in RomVault's database. Useful for multi-disc or multi-format releases where all variants live in one subfolder.
+
+---
+
+### Structure 4 — First Level Dirs as Games + Merge Dirs in Games
+
+First-level subfolders become `<game>` entries. All deeper physical subfolders are merged flat into that game entry. Each merged subfolder gets an empty directory marker rom (`size="0" crc="00000000"`) followed by its files listed with path-prefixed rom names.
+
+```xml
+<game name="Crime Wave (1990)">
+    <description>Crime Wave (1990)</description>
+    <rom name="Crime Wave (1990) (Disk A).ima" .../>
+    <rom name="Crime Wave (1990) (Disk B).ima" .../>
+    <rom name="original/" size="0" crc="00000000"/>          ← empty dir marker
+    <rom name="original/Crime Wave (1990) (v1.0).ima" .../>
+</game>
+<game name="Docs">
+    <description>Docs</description>
+    <rom name="Amazon Docs/" size="0" crc="00000000"/>
+    <rom name="Amazon Docs/Amazon - Manual.pdf" .../>
+    <rom name="Crime Wave Docs/" size="0" crc="00000000"/>
+    <rom name="Crime Wave Docs/Crime Wave - Manual.pdf" .../>
+</game>
+```
+
+**Use when:** Collections have deep and variable subfolder hierarchies, and you want a single flat game entry to capture everything within a top-level folder including folder structure metadata. Well-suited to tape archives, rhythm game collections, and any collection where internal directory layout is part of the preservation data.
+
+> In the survey, **2.0% of dats** used this structure — primarily complex arcade collections and large preservation projects with nesting depths between 4 and 9 levels.
+
+---
+
+## Format: Modern vs Legacy
+
+| Setting | `<game>` / `<machine>` | `<dir>` | `<description>` |
+|---|---|---|---|
+| **Modern** | ✅ Used for archive entries | ✅ Used for folders | Optional (checkbox) |
+| **Legacy** | ❌ | All entries use `<dir>` | Not emitted |
+
+**Modern** is the correct choice for RomVault. The Legacy format (all `<dir>` tags, no `<game>`) is ClrMamePro's native format and is retained for compatibility with older toolchains.
+
+When Modern is selected, an additional option appears: **Use `<machine>` instead of `<game>`**. This is the element name used by EmuMovies and some MAME-derived dat files. Unless you are producing dats specifically for an EmuMovies-style workflow, leave this set to `<game>`.
+
+---
+
+## Hash Options
+
+CRC32 and SHA1 are always computed. Both are mandatory in Logiqx XML and are the primary integrity verification hashes used by RomVault.
+
+| Option | Attribute | Notes |
+|---|---|---|
+| **MD5** | `md5=` | Optional. Adds meaningful overhead per file. Written after `sha1=` in the rom tag |
+| **SHA-256** | `sha256=` | Optional. Written after `sha1=` and before `md5=`. Informational — RomVault displays it but does not use it for matching |
+
+Attribute order in the output rom tag follows the RomVault DATReader source exactly:
+`name` → `size` → `crc` → `sha1` → `sha256` → `md5` → `date`
+
+---
+
+## Extension Filters
+
+Available in **Mixed mode only** — in Zipped mode the unit is always the complete `.zip` file.
+
+| Field | Behaviour |
+|---|---|
+| **Include only extensions** | If set, only files matching these extensions are hashed and included. Blank = include everything |
+| **Exclude extensions / files** | Files matching these extensions or exact filenames are always skipped |
+
+**Format:** Comma-separated. Leading dots are optional. Full filenames are supported.
+
+```
+.ima, .mfm, .86f, .td0        ← include only floppy image formats
+.nfo, .sfv, .md5, thumbs.db   ← typical exclusion list
+```
+
+Filtering is applied during the folder scan phase, before any hashing begins. Excluded files never enter the work queue.
+
+---
+
+## 7-Zip ZStandard Support
+
+All zip analysis in this tool — for both Mixed and Zipped modes — is performed exclusively through **7-Zip-ZStandard**. Python's built-in `zipfile` module cannot handle ZStandard-compressed archives (compression method 93), which is the format produced by RomVault's own RV-ZStandard recompressor and by TorrentZip equivalents.
+
+**Detection:** An RV-ZStandard archive can be identified by its zip comment, which begins with `RVZSTD-` followed by a CRC32 checksum (e.g. `RVZSTD-22DA5DD0`). TorrentZip archives use a similar deterministic recompression approach that also sets standardised internal timestamps (`1980/00/00 00-00-00`).
+
+**Path configuration:** Set the full path to `7z.exe` in the **7-Zip-ZStandard** field. The default `C:\Program Files\7-Zip-Zstandard\7z.exe` is used if the field is left blank.
+
+The tool can also be drag-and-dropped a `7z.exe` directly onto the path field.
+
+**File date and timestamps (Zipped mode):** When **File date & time** is enabled, the timestamp for each rom entry is read from the zip's internal metadata and written as `date="yyyy/mm/dd hh-mm-ss"`. For TorrentZip and RV-ZStandard archives this will always be `1980/00/00 00-00-00`, which is the standardised DOS epoch timestamp these tools write. This is intentional — it documents that the archive has been deterministically recompressed, and preserves the timestamp value for any future rom manager that implements timestamp restoration.
+
+---
+
+## Parent Name and Output Folder Structure
+
+### Dat Naming
+
+Every datfile is named using the following pattern:
+
+```
+[ParentName - ] TopLevelFolderName - SubFolderName (YYYY-MM-DD_RomVault).xml
+```
+
+With **Parent name** set to `Digitoxin` and an input root of `Floppy`, processing the subfolder `Access Software PC Floppy Disk Image Collection` produces:
+
+```
+Digitoxin - Floppy - Access Software PC Floppy Disk Image Collection (2026-04-24_RomVault).xml
+```
+
+The `_RomVault` suffix is deliberate — it flags dats produced by this tool to downstream tools and distribution platforms, and prevents name collisions with dats produced by other sources covering the same content.
+
+The **Parent name** field was added specifically to support external dat distribution platforms where generic or duplicated dat names cause indexing conflicts. By prepending a consistent identifying prefix, your entire dat output is uniquely namespaced.
+
+### Output Folder Structure
+
+Output always mirrors the input folder structure, rooted at a folder named after the input top-level folder:
+
+```
+Output root\
+    TopLevelFolderName\          ← created automatically
+        SubFolder1\
+            Dat1.xml
+        SubFolder2\
+            Dat2.xml
+```
+
+This matches RomVault's expected DatRoot layout, where datfiles and their parent folders establish the scanning hierarchy. **Do not output flat** — RomVault uses the folder structure of DatRoot to define collection boundaries.
+
+---
+
+## Dat Preview Window
+
+After a run completes, the **🔍 Preview Dats** button becomes active. It opens a preview window showing the XML of every dat produced during that run.
+
+**Features:**
+- Listbox of all completed dats — click any entry to switch
+- Four **Structure** radio buttons, independent from the main window — switching any option instantly re-renders the selected dat from in-memory data, with no re-hashing
+- Full XML syntax highlighting (angle brackets, tag names, attribute names, attribute values, text content)
+- Selectable and copyable text — `Ctrl+A` selects all, `Ctrl+C` copies, right-click for context menu
+- **Save Chosen Dat Structure As...** — writes the currently displayed XML to a file of your choosing, named with the structure label appended
+
+The preview re-renders entirely from the hash data held in memory — switching structures is instantaneous even for large dats. This is the equivalent of dir2datUI's live preview mode, and is the recommended way to evaluate structure options against your real data before deciding which to use for a project.
+
+---
+
+## Settings and Config File
+
+All settings are saved to `Eggmans_Datfile_Creator_config.json` in the same folder as the script. Settings are written automatically when **Start** is pressed and can be explicitly saved at any time with the **Save Settings** button.
+
+The config is plain JSON and can be edited by hand if needed. Unrecognised keys are silently ignored on load, so editing is safe.
+
+---
+
+## Advanced: Datfile Landscape Analysis
+
+> **This section is for collectors and advanced users curious about the broader datfile ecosystem. None of this is required reading to use the tool.**
+
+To understand how the datfiles produced by this tool relate to the wider landscape, a structural analysis was performed across two large RomVault-managed collections using a companion script (`analyze_datfiles.py`, included with this project).
+
+### Collections Surveyed
+
+| Collection | Dats analysed | Parse failures | Games | ROMs |
+|---|---|---|---|---|
+| Core (general) | 10,136 | 4 | 3,473,346 | 20,594,118 |
+| Arcade | 350 | 7 | 62,481 | 49,555,576 |
+| **Combined** | **10,486** | **11** | **3,535,827** | **70,149,694** |
+
+Parse failures were all `.txt` files present in the DatRoot folder — not actual datfiles.
+
+### Structure Distribution
+
+| Structure | Core | Arcade | Total | Share |
+|---|---|---|---|---|
+| Standard Logiqx `<game>→<rom>` (depth 3) | 7,006 | 219 | 7,225 | **68.8%** |
+| EmuMovies `<machine>` flat | 2,909 | 0 | 2,909 | **27.7%** |
+| Complex `<dir>+<game>` (depth 4–9) | 87 | 128 | 215 | **2.0%** |
+| ClrMamePro text format | 132 | 2 | 134 | **1.3%** |
+| Flat ROMs only (no `<game>` wrapper) | 2 | 1 | 3 | **~0%** |
+
+**The standard Logiqx structure at depth 3 accounts for nearly 97.7% of all XML datfiles in the core collection.** This is the structure produced by No-Intro, Redump, TOSEC, GoodMerge, and the vast majority of community dat projects. It is what this tool produces in Zipped mode with Structure 2 (Archives as Games).
+
+### The EmuMovies Ecosystem
+
+2,909 dats (27.7% of the core collection) use `<machine>` entries with `forcepacking="unzip"`. These are artwork and media packs distributed by EmuMovies — snapshots, box art, manuals, videos — not ROM sets. They use a different structural convention (`<machine>` instead of `<game>`) because they originate from MAME-derived tooling. This tool can output `<machine>` tags via the Modern format option, but EmuMovies dats are not a target use case for a dat generator — they are produced by EmuMovies' own internal pipeline.
+
+### The `forcepacking` Values in the Wild
+
+| Value | Count | What it means |
+|---|---|---|
+| *(absent)* | 8,705 | RomVault defaults to Zip mode — contents verified against rom entries |
+| `fileonly` | 1,582 | Files are managed as atomic units — no inspection of archive contents |
+| `unzip` | 197 | RomVault extracts files before verification — EmuMovies-specific |
+| `zip` | 2 | Explicitly request Zip mode — redundant with absent, almost never used |
+
+This tool produces only `fileonly` (Mixed mode) and absent (Zipped mode). The `unzip` and `zip` values are not generated.
+
+### Nesting Depth
+
+The depth histogram reveals just how uniform real-world datfiles are:
+
+| Depth | Description | Core count |
+|---|---|---|
+| 1 | ClrMamePro text (no XML nesting) | 132 |
+| 2 | Flat ROMs only, no game wrapper | 2 |
+| **3** | **`<datafile>→<game>→<rom>` — the universal standard** | **9,904** |
+| 4 | One level of `<dir>` inside games | 50 |
+| 5–9 | Deep preservation collections | 48 |
+
+Dats at depth 5 and above were without exception large PC or arcade preservation projects with complex physical directory structures — the Digitoxin PC Floppy Disk Image Collection, DUSTBUNNiES, and Eggman's Arcade Repository. These collections are themselves produced by this tool or close predecessors of it. The deepest dat in the survey reached depth 9 (Funworld touchscreen collection: 324 physical dirs, 868 game entries).
+
+### ClrMamePro Format
+
+134 dats across both collections use ClrMamePro's text-based format rather than Logiqx XML. All of these originate from sources that pre-date the shift to XML as the standard (EMMA Italian Dumping Team, legacy firmware packs). RomVault reads both formats without issue, and for a long time ClrMamePro format was the primary exchange format for arcade dat files. This tool produces only Logiqx XML, which is the current standard and the format RomVault's own tools generate.
+
+### SHA-256 in Datfiles
+
+SHA-256 support was introduced to the Logiqx dat format by No-Intro's Dat-o-Matic database and is present in many No-Intro dats. RomVault will display the SHA-256 value when it exists in a dat, but does not use it as part of its hash matching or ROM verification workflow — CRC32 and SHA1 are the operative hashes. SHA-256 is available as an optional output field in this tool for completeness, but for most collections it adds computation time without practical benefit.
+
+---
+
+## Advanced: DAT Format Reference
+
+> **For users who want to understand exactly what the tool is writing. Skip this if you don't need to hand-edit datfiles.**
+
+### Header Block
+
+```xml
+<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>Digitoxin - Floppy - Access Software PC Floppy Disk Image Collection</name>
+        <description>PC Floppy Disk Image Collection</description>
+        <category>PC</category>
+        <version>2026-04-24</version>
+        <date>2026-04-24</date>
+        <author>Digitoxin</author>
+        <url>https://github.com/Eggmansworld</url>
+        <homepage>https://github.com/Eggmansworld</homepage>
+        <comment></comment>
+        <romvault forcepacking="fileonly"/>   ← Mixed mode
+        <!-- or: <romvault/>  ← Zipped mode -->
+    </header>
+    ...
+</datafile>
+```
+
+### ROM Entry Attribute Order
+
+Attribute order follows the RomVault DATReader source (`DatXMLWriter.cs`):
+
+```xml
+<rom name="filename.ima"
+     size="368640"
+     crc="3a9f12b4"
+     sha1="d4e9c02a7f1b3e5d8c6a0f4b2e7d1a9c3f5b8e2d"
+     sha256="b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+     md5="5eb63bbbe01eeed093cb22bb8f5acdc3"
+     date="1980/00/00 00-00-00"/>
+```
+
+`sha256` and `md5` are only written when their respective checkboxes are enabled. `date` is only written when **File date & time** is enabled (Zipped mode only).
+
+### `<game>` vs `<dir>` in RomVault
+
+In RomVault's internal model (from `RVWorld` source):
+- A `<game>` tag represents a `DatDir` with a `DGame` attached — it appears in RomVault's scanner as a named game entry with fixable ROM slots
+- A `<dir>` tag represents a `DatDir` without a `DGame` — it appears as a structural folder in the tree, not a fixable entry
+
+This distinction matters for RomVault's Fix engine: only `<game>` entries can be fixed (have files moved into them from the ToSort folder). `<dir>` entries are containers only.
+
+---
+
+## Known Limitations
+
+- **Output format is Logiqx XML only.** ClrMamePro text format and RomCenter format are not supported.
+- **Zipped mode only processes `.zip` files.** Archives in other formats (`.7z`, `.rar`, `.gz`) are ignored. If your collection uses these formats in Mixed mode, they are hashed as files (which is correct for Mixed/fileonly collections).
+- **The `forcepacking="unzip"` and `forcepacking="zip"` values are not generated.** Only `fileonly` (Mixed) and absent (Zipped) are produced.
+- **`<softwarelist>` and MAME XML formats are not produced.** These are specialised formats for MAME's internal database and are outside the scope of this tool.
+- **Per All mode with very large collections may be slow.** The scanner must traverse every folder at every depth. Mixed mode with SHA-256 enabled on large uncompressed files will be the primary bottleneck.
+
+---
+
+## Licensing
+
+Original source code, scripts, tooling, and hand-authored documentation and
+metadata in this repository are licensed under the MIT License.
+
+Archived game data, binaries, firmware, media assets, and other third-party
+materials are **not** covered by the MIT License and remain the property of
+their respective copyright holders.
+
+See the `LICENSE` and `NOTICE` files for full details and scope clarification.
+
+---
+
+## CREDITS
+
+Created for the preservation community by Eggman, with Claude’s help turning ideas into code.
+
+If you improve the script, feel free to share your changes back with the community.
+
+*Made with ❤️ for the retro game preservation community.*
+---
