@@ -1,8 +1,8 @@
-# Eggman's Datfile Creator
+# Eggman's Datfile Creator Suite
 
 A bulk datfile generation tool for **RomVault**, built for collectors who manage large, structured archives and need consistent, reproducible DAT files across hundreds or thousands of folders.
 
-Produces **Logiqx XML** datfiles compatible with RomVault, ClrMamePro, and RomCenter. Supports both **Mixed (Archive as File)** and **Zipped** collection types, with four structure options that replicate the datfile output styles that RomVault natively supports.
+Produces **Logiqx XML** datfiles compatible with RomVault, ClrMamePro, and RomCenter. Supports both **Mixed (Archive as File)** and **Zipped** collection types, with four structure options that replicate the datfile output styles that RomVault natively supports. Includes an incremental update engine for keeping existing datfiles current without rehashing unchanged content.
 
 ---
 
@@ -44,6 +44,9 @@ If this tool saves you time, consider supporting the work:
 - [7-Zip ZStandard Support](#7-zip-zstandard-support)
 - [Parent Name and Output Folder Structure](#parent-name-and-output-folder-structure)
 - [Dat Preview Window](#dat-preview-window)
+- [Run Progress Window](#run-progress-window)
+- [Incremental Update — Skip Already-Hashed Files](#incremental-update--skip-already-hashed-files)
+- [Folder Structure Analyzer](#folder-structure-analyzer)
 - [Settings and Config File](#settings-and-config-file)
 - [Advanced: Datfile Landscape Analysis](#advanced-datfile-landscape-analysis)
 - [Advanced: DAT Format Reference](#advanced-dat-format-reference)
@@ -73,7 +76,8 @@ pip install tkinterdnd2
    pip install tkinterdnd2
    ```
 4. Download `Eggmans_Datfile_Creator.py` and place it anywhere convenient
-5. Run it:
+5. Optionally place `Eggmans_Datfile_Creator_banner.png` in the same folder for the About window banner
+6. Run it:
    ```
    python Eggmans_Datfile_Creator.py
    ```
@@ -93,6 +97,10 @@ The script saves its config file (`Eggmans_Datfile_Creator_config.json`) in the 
 7. Choose **Format**: Modern
 8. Click **Start**
 
+A detached **Run Progress** window opens automatically when the run begins, showing live status, progress, and activity log.
+
+Not sure which structure to use? Use **Tools → Analyze Folder Structure** before your first run.
+
 ---
 
 ## Interface Overview
@@ -105,6 +113,8 @@ The script saves its config file (`Eggmans_Datfile_Creator_config.json`) in the 
 | **Output folder (dat root)** | Root of the output structure. Datfiles are written into subfolders that mirror the input |
 | **Parent name (optional prefix)** | Prepended to every dat name: `Parent - TopLevel - Subfolder` |
 | **7-Zip-ZStandard (7z.exe)** | Full path to `7z.exe` from the 7-Zip-ZStandard release |
+
+All path fields support drag-and-drop.
 
 ### DAT Header Fields
 
@@ -125,7 +135,7 @@ The `<name>` tag is populated automatically from the dat filename stem. Every da
 
 ### Options
 
-All options are described in detail in their own sections below. The UI greys out options that do not apply to the current combination of Dat Type and Generation mode — this prevents invalid combinations without hiding the controls.
+All options are described in detail in their own sections below. The UI greys out options that do not apply to the current combination of Dat Type and Generation mode — this prevents invalid combinations without hiding the controls. A **📖 link** to this README is provided directly beneath the Structure options for quick reference.
 
 ---
 
@@ -229,9 +239,9 @@ Use this mode for large heterogeneous collections where subfolders are logically
 
 ## Structure Options
 
-Structure controls how the internal hierarchy of a datfile is expressed. It only applies to **1 Dat per Root Folder** mode — in Per All mode every dat is flat by definition.
+Structure controls how the internal hierarchy of a datfile is expressed. It only applies to **1 Dat per Root Folder** mode — in **1 dat per root folder & all subfolders**, every dat is flat by definition.
 
-The four structures replicate the output options from RomVault's dir2datUI tool. Use the **Preview window** to compare them side-by-side against your actual data before committing to a structure.
+The four structures replicate the output options from RomVault's dir2datUI tool. Use the **Preview window** to compare them side-by-side against your actual data before committing to a structure. Not sure where to start? Use **Tools → Analyze Folder Structure** first.
 
 ### Reference Folder Layout
 
@@ -262,9 +272,6 @@ Every folder at every depth becomes a `<dir>` tag. No `<game>` tags are used any
     <dir name="Crime Wave (1990) (Disk A)">
         <rom name="Crime Wave (1990) (Disk A).ima" size="368640" crc="3a9f12b4" sha1="..."/>
     </dir>
-    <dir name="Crime Wave (1990) (Disk B)">
-        <rom name="Crime Wave (1990) (Disk B).ima" .../>
-    </dir>
     <dir name="original">
         <dir name="Crime Wave (1990) (v1.0)">
             <rom name="Crime Wave (1990) (v1.0).ima" .../>
@@ -277,7 +284,6 @@ Every folder at every depth becomes a `<dir>` tag. No `<game>` tags are used any
             <rom name="Amazon - Manual.pdf" .../>
         </dir>
     </dir>
-    ...
 </dir>
 ```
 
@@ -296,10 +302,6 @@ This is the **default and most widely used structure**. It matches the output fo
     <description>Crime Wave (1990) (Disk A)</description>
     <rom name="Crime Wave (1990) (Disk A).ima" size="368640" crc="3a9f12b4" sha1="..."/>
 </game>
-<game name="Crime Wave (1990) (Disk B)">
-    <description>Crime Wave (1990) (Disk B)</description>
-    <rom name="Crime Wave (1990) (Disk B).ima" .../>
-</game>
 <dir name="original">
     <game name="Crime Wave (1990) (v1.0)">
         <description>Crime Wave (1990) (v1.0)</description>
@@ -311,11 +313,6 @@ This is the **default and most widely used structure**. It matches the output fo
         <game name="Amazon - Manual">
             <description>Amazon - Manual</description>
             <rom name="Amazon - Manual.pdf" .../>
-        </game>
-    </dir>
-    <dir name="Crime Wave Docs">
-        <game name="Crime Wave - Manual">
-            ...
         </game>
     </dir>
 </dir>
@@ -334,9 +331,9 @@ The first level of physical subfolders inside the dat root are always rendered a
 ```xml
 <game name="Crime Wave (1990)">
     <description>Crime Wave (1990)</description>
-    <rom name="Crime Wave (1990) (Disk A).ima" .../>      ← direct archives merged in
+    <rom name="Crime Wave (1990) (Disk A).ima" .../>
     <rom name="Crime Wave (1990) (Disk B).ima" .../>
-    <rom name="original/Crime Wave (1990) (v1.0).ima" .../> ← internal subdir path preserved
+    <rom name="original/Crime Wave (1990) (v1.0).ima" .../>
 </game>
 <game name="Docs">
     <description>Docs</description>
@@ -344,9 +341,6 @@ The first level of physical subfolders inside the dat root are always rendered a
         <game name="Amazon - Manual">
             <rom name="Amazon - Manual.pdf" .../>
         </game>
-    </dir>
-    <dir name="Crime Wave Docs">
-        ...
     </dir>
 </game>
 ```
@@ -364,7 +358,7 @@ First-level subfolders become `<game>` entries. All deeper physical subfolders a
     <description>Crime Wave (1990)</description>
     <rom name="Crime Wave (1990) (Disk A).ima" .../>
     <rom name="Crime Wave (1990) (Disk B).ima" .../>
-    <rom name="original/" size="0" crc="00000000"/>          ← empty dir marker
+    <rom name="original/" size="0" crc="00000000"/>
     <rom name="original/Crime Wave (1990) (v1.0).ima" .../>
 </game>
 <game name="Docs">
@@ -435,9 +429,7 @@ All zip analysis in this tool — for both Mixed and Zipped modes — is perform
 
 **Detection:** An RV-ZStandard archive can be identified by its zip comment, which begins with `RVZSTD-` followed by a CRC32 checksum (e.g. `RVZSTD-22DA5DD0`). TorrentZip archives use a similar deterministic recompression approach that also sets standardised internal timestamps (`1980/00/00 00-00-00`).
 
-**Path configuration:** Set the full path to `7z.exe` in the **7-Zip-ZStandard** field. The default `C:\Program Files\7-Zip-Zstandard\7z.exe` is used if the field is left blank.
-
-The tool can also be drag-and-dropped a `7z.exe` directly onto the path field.
+**Path configuration:** Set the full path to `7z.exe` in the **7-Zip-ZStandard** field. The default `C:\Program Files\7-Zip-Zstandard\7z.exe` is used if the field is left blank. The field supports drag-and-drop.
 
 **File date and timestamps (Zipped mode):** When **File date & time** is enabled, the timestamp for each rom entry is read from the zip's internal metadata and written as `date="yyyy/mm/dd hh-mm-ss"`. For TorrentZip and RV-ZStandard archives this will always be `1980/00/00 00-00-00`, which is the standardised DOS epoch timestamp these tools write. This is intentional — it documents that the archive has been deterministically recompressed, and preserves the timestamp value for any future rom manager that implements timestamp restoration.
 
@@ -482,7 +474,7 @@ This matches RomVault's expected DatRoot layout, where datfiles and their parent
 
 ## Dat Preview Window
 
-After a run completes, the **🔍 Preview Dats** button becomes active. It opens a preview window showing the XML of every dat produced during that run.
+After a run completes, the **🔍 Preview Dats** button becomes active (in both the main window and the Run Progress window). It opens a preview window showing the XML of every dat produced during that run.
 
 **Features:**
 - Listbox of all completed dats — click any entry to switch
@@ -492,6 +484,82 @@ After a run completes, the **🔍 Preview Dats** button becomes active. It opens
 - **Save Chosen Dat Structure As...** — writes the currently displayed XML to a file of your choosing, named with the structure label appended
 
 The preview re-renders entirely from the hash data held in memory — switching structures is instantaneous even for large dats. This is the equivalent of dir2datUI's live preview mode, and is the recommended way to evaluate structure options against your real data before deciding which to use for a project.
+
+---
+
+## Run Progress Window
+
+When **Start** is pressed, a detached **Run Progress** window opens automatically. This window is separate from the main window, allowing you to monitor the run while the main settings remain visible and accessible.
+
+**Features:**
+- Live status line, item counts, and progress bar
+- Scrollable activity log with colour-coded entries (blue for folder events, green for completed dats)
+- **📋 Show Progress** button in the main window re-opens the progress window if it has been closed — the activity log is preserved until the next run starts
+- **🔍 Preview Dats** button enables in the progress window once a run completes
+- **💾 Save Activity Log** — saves the full log to a text file
+- The window cannot be closed while a run is in progress — use Soft Stop or Hard Stop first
+
+The progress window opens at a fixed position on screen and can be freely moved and resized.
+
+---
+
+## Incremental Update — Skip Already-Hashed Files
+
+For large collections — particularly those in the hundreds of GB or multi-TB range — rehashing every file on every run is impractical. The incremental update mode allows the tool to update an existing datfile by hashing only new or changed content, carrying forward hash data for everything that hasn't changed.
+
+**Enable it:** Tick **Incremental update — skip already-hashed files** in the Dat Settings section and point the **Existing dat file or folder** field to the dat you want to update (or the folder containing your dats for bulk updates).
+
+### How it works
+
+When Start is pressed with incremental mode active, a **Pre-flight Check** dialog opens before any processing begins:
+
+1. **Validation** — the tool scans the dat source folder recursively and cross-checks each dat's entries against the source file/zip folder. It reports a match percentage per dat and flags anything missing.
+2. **New version** — optionally set a new `<version>` string for the updated dat header.
+3. **Proceed / Rehash entire folder / Rescan Dats / Cancel** — choose how to continue.
+
+### Matching strategy
+
+**Zipped mode:** Each zip is checked against the dat using filename + uncompressed size + CRC32 (read from the zip central directory — no decompression needed, takes milliseconds). If all three match, the existing SHA1, MD5, and SHA-256 values are carried forward directly from the dat. Only new or changed zips are fully analyzed.
+
+**Mixed mode:** Files are matched by filename + size only. If both match, existing hash data is carried forward. If a file was replaced with content of the same name and the same size, the change cannot be detected without a full rehash — see the warning in the Pre-flight Check dialog.
+
+### After a successful update
+
+- The new datfile is written with today's date in both the filename and the `<date>` header field.
+- The original datfile is renamed to `filename.xml.old` — this invalidates it from RomVault's perspective while preserving it for reference. If an `.old` file already exists, a numeric suffix is appended (`filename(1).old`, `filename(2).old`, etc.).
+- There is never more than one active `.xml` datfile in a folder at a time.
+
+### Validation and path alignment
+
+The tool uses relative path mirroring to match dats to their source folders. A dat at `dats/Activision PC Floppy/foo.xml` is assumed to correspond to `input_root/Activision PC Floppy/`. This works correctly as long as your dat output folder structure mirrors your input folder structure — which it always will if dats were generated by this tool.
+
+If the match percentage drops below 80%, the Pre-flight Check displays a warning. You can still proceed — entries not found in the source folder will be removed from the updated dat — but the warning gives you the opportunity to verify that the paths are correctly aligned before committing.
+
+Use **🔄 Rescan Dats** inside the Pre-flight Check to re-run validation after making changes without closing and reopening the dialog.
+
+---
+
+## Folder Structure Analyzer
+
+Available via **Tools → Analyze Folder Structure...** in the menu bar.
+
+If you are unsure which Generation mode or Structure option is appropriate for a collection, the Analyzer can examine the folder layout and make a recommendation before any hashing takes place.
+
+**How to use:**
+1. Open the Analyzer from the Tools menu
+2. Set the folder path (or drag-and-drop it onto the field)
+3. Select whether the content is **Mixed** or **Zipped**
+4. Click **Analyze**
+
+The Analyzer walks the folder structure (no hashing, completes in seconds even for large collections) and reports:
+
+- Total folders and items found
+- Depth distribution — how many levels of subfolders exist
+- Pattern breakdown — flat game folders, container folders, folders with nested subdirs
+- Sample folder names for spot-checking
+- **Recommendation** — a suggested Generation mode and Structure option, colour-coded by confidence level (green = high, amber = medium)
+
+Clicking **Apply Recommended Settings** fills the main window's Dat Type, Generation, Structure, Format, and Input folder fields automatically and closes the Analyzer.
 
 ---
 
@@ -628,6 +696,7 @@ This distinction matters for RomVault's Fix engine: only `<game>` entries can be
 - **Zipped mode only processes `.zip` files.** Archives in other formats (`.7z`, `.rar`, `.gz`) are ignored. If your collection uses these formats in Mixed mode, they are hashed as files (which is correct for Mixed/fileonly collections).
 - **The `forcepacking="unzip"` and `forcepacking="zip"` values are not generated.** Only `fileonly` (Mixed) and absent (Zipped) are produced.
 - **`<softwarelist>` and MAME XML formats are not produced.** These are specialised formats for MAME's internal database and are outside the scope of this tool.
+- **Incremental update Mixed mode cannot detect same-name same-size file replacements.** If a file has been replaced with content of identical filename and size, the change will not be detected. The Pre-flight Check dialog warns of this when Mixed mode is active. A full rehash option is available in the dialog for this scenario.
 - **Per All mode with very large collections may be slow.** The scanner must traverse every folder at every depth. Mixed mode with SHA-256 enabled on large uncompressed files will be the primary bottleneck.
 
 ---
@@ -647,9 +716,8 @@ See the `LICENSE` and `NOTICE` files for full details and scope clarification.
 
 ## CREDITS
 
-Created for the preservation community by Eggman, with Claude’s help turning ideas into code.
+Created for the preservation community by Eggman, with Claude's help turning ideas into code.
 
 If you improve the script, feel free to share your changes back with the community.
 
 *Made with ❤️ for the retro game preservation community.*
----
