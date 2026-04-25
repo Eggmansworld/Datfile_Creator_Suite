@@ -6,6 +6,10 @@ Produces **Logiqx XML** datfiles compatible with RomVault, ClrMamePro, and RomCe
 
 ---
 
+<img width="1619" height="971" alt="Eggmans_Datfile_Creator" src="https://github.com/user-attachments/assets/6d937f6f-ab83-4950-81ca-e817a057d0e1" />
+
+---
+
 If this tool saves you time, consider supporting the work:
 
 <a href="https://buymeacoffee.com/eggmansworld">
