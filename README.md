@@ -162,16 +162,20 @@ The header always contains `<romvault forcepacking="fileonly"/>`, which instruct
 - Any collection where the archive boundary is the logical game boundary
 - Collections managed as scene-style releases where the zip is the delivery unit
 
-## RomVault Mixed/fileonly Caveat:
+### :warning: RomVault Mixed/fileonly Caveat:
 - dats that are created in **Mixed (Archive as File)** mode (aka "fileonly") have a fileonly header tag added to the dats to indicate to RomVault that it is dealing with a fileonly dat and to display it as such.
-- the dat's <rom> entries need to be wrapped in a <game> block, which is named after its parent folder name. This <game> block must exist to support the ability for a user to switch the Dat Rule on the folder from fileonly to a compression format if they decide they want to compress the folder.  Without the <game> block, RomVault will throw errors forever and require the user to kill the process.
-- By adding the <game> block, this creates a new internal "set" folder for the fileonly roms to reside in, but this throws out the alignment of the dat folder vs. the file folder. Pre-existing roms will end up with a Cyan status because of the insertion of the folder.  If you try to scan and rebuild, you'll end up with an extra parent folder in your folder path, which is undesirable.
-**- To fix this, the user must set a DAT Rule on the parent folder of "Single Archive", and "Do not use subdirs for sets" to remove this internal <game> block and have the folder behave like a fileonly dat again.**
-<img width="473" height="296" alt="image" src="https://github.com/user-attachments/assets/e0df22ca-1c0d-446f-bd28-086ce720dc13" />
-- _This anomaly occurs because of how RomVault is coded, not how the datfile is designed._
+- the dat's <rom> entries need to be wrapped in a `<game>` block, which is named after its parent folder name. This `<game>` block must exist to support the ability for a user to switch the Dat Rule on the folder from fileonly to a compression format if they decide they want to compress the folder.  Without the `<game>` block, RomVault will throw errors forever and require the user to kill the process.
+- Adding the `<game>` block creates a new internal "set" folder for the fileonly roms to reside in, but this throws out the alignment of the dat folder vs. the file folder. Pre-existing roms will end up with a Cyan status because of the insertion of the folder throwing the file locations out of whack.  If you try to scan and rebuild, you'll end up with an extra parent folder in your folder path, which is undesirable.
+- **To fix this, the user must set a DAT Rule on the parent folder of "Single Archive", and "Do not use subdirs for sets" to remove this internal <game> block and have the folder behave like a fileonly dat again.**
+
+> <img width="473" height="296" alt="image" src="https://github.com/user-attachments/assets/e0df22ca-1c0d-446f-bd28-086ce720dc13" />
+
+:arrow_right: **This anomaly occurs because of how RomVault is coded, not how the datfile is designed.**
 
 Additional factoid:
-- if you load a datfile and you get an an "**Incompatible Compare Type**" error when trying to apply the compression setting to a folder, it means the datfile's <rom> contents have no <game> block wrapped around the files, and one must be added around the <rom> contents.
+- if you load a datfile and you get an an "**Incompatible Compare Type**" error when trying to apply the compression setting to a folder, load the datfile into a text editor and check if the datfile's `<rom>` contents have a `<game>` block wrapped around the files.  If not, one must be added.
+
+---
 
 ### Zipped
 
