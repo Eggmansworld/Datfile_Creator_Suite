@@ -47,9 +47,6 @@ If this tool saves you time, consider supporting the work:
 - [Run Progress Window](#run-progress-window)
 - [Incremental Update — Skip Already-Hashed Files](#incremental-update--skip-already-hashed-files)
 - [Folder Structure Analyzer](#folder-structure-analyzer)
-- [Tools Menu](#tools-menu)
-  - [Bulk Datfile Header Updater](#bulk-datfile-header-updater)
-  - [Game and ROM Counter](#game-and-rom-counter)
 - [Settings and Config File](#settings-and-config-file)
 - [Advanced: Datfile Landscape Analysis](#advanced-datfile-landscape-analysis)
 - [Advanced: DAT Format Reference](#advanced-dat-format-reference)
@@ -78,14 +75,14 @@ pip install tkinterdnd2
    ```
    pip install tkinterdnd2
    ```
-4. Download `Eggmans_Datfile_Creator_Suite.py` and place it anywhere convenient
+4. Download `Eggmans_Datfile_Creator.py` and place it anywhere convenient
 5. Optionally place `Eggmans_Datfile_Creator_banner.png` in the same folder for the About window banner
 6. Run it:
    ```
-   python Eggmans_Datfile_Creator_Suite.py
+   python Eggmans_Datfile_Creator.py
    ```
 
-The script saves its config file (`Eggmans_Datfile_Creator_Suite_config.json`) in the same directory as the script itself.
+The script saves its config file (`Eggmans_Datfile_Creator_config.json`) in the same directory as the script itself.
 
 ---
 
@@ -134,7 +131,7 @@ These map directly to the `<header>` block in the output datfile. All fields exc
 | Homepage | `<homepage>` | Homepage URL |
 | Comment | `<comment>` | Free text notes |
 
-The `<n>` tag is populated automatically from the dat filename stem. Every dat also receives `<romvault/>` as the last header tag — this is the base RomVault recognition token, and expands to `<romvault forcepacking="fileonly"/>` when Mixed mode is active.
+The `<name>` tag is populated automatically from the dat filename stem. Every dat also receives `<romvault/>` as the last header tag — this is the base RomVault recognition token, and expands to `<romvault forcepacking="fileonly"/>` when Mixed mode is active.
 
 ### Options
 
@@ -164,21 +161,6 @@ The header always contains `<romvault forcepacking="fileonly"/>`, which instruct
 - PC floppy/CD image collections where each game is a discrete archive
 - Any collection where the archive boundary is the logical game boundary
 - Collections managed as scene-style releases where the zip is the delivery unit
-
-### :warning: RomVault Mixed/fileonly Caveat:
-- Dats created in **Mixed (Archive as File)** mode (aka "fileonly") have a fileonly header tag added to the dats to indicate to RomVault that it is dealing with a fileonly dat and to display it as such.
-- The dat's `<rom>` entries need to be wrapped in a `<game>` block, which is named after its parent folder name. This `<game>` block must exist to support the ability for a user to switch the Dat Rule on the folder from fileonly to a compression format if they decide they want to compress the folder. Without the `<game>` block, RomVault will throw errors forever and require the user to kill the process.
-- Adding the `<game>` block creates a new internal "set" folder for the fileonly roms to reside in, but this throws out the alignment of the dat folder vs. the file folder. Pre-existing roms will end up with a Cyan status because of the insertion of the folder throwing the file locations out of whack. If you try to scan and rebuild, you'll end up with an extra parent folder in your folder path, which is undesirable.
-- **To fix this, the user must set a DAT Rule on the parent folder of "Single Archive", and "Do not use subdirs for sets" to remove this internal `<game>` block and have the folder behave like a fileonly dat again.**
-
-> <img width="473" height="296" alt="image" src="https://github.com/user-attachments/assets/e0df22ca-1c0d-446f-bd28-086ce720dc13" />
-
-:arrow_right: **This anomaly occurs because of how RomVault is coded, not how the datfile is designed.**
-
-Additional factoid:
-- If you load a datfile and you get an **"Incompatible Compare Type"** error when trying to apply the compression setting to a folder, load the datfile into a text editor and check if the datfile's `<rom>` contents have a `<game>` block wrapped around the files. If not, one must be added.
-
----
 
 ### Zipped
 
@@ -414,7 +396,7 @@ CRC32 and SHA1 are always computed. Both are mandatory in Logiqx XML and are the
 | Option | Attribute | Notes |
 |---|---|---|
 | **MD5** | `md5=` | Optional. Adds meaningful overhead per file. Written after `sha1=` in the rom tag |
-| **SHA-256** | `sha256=` | Optional. Written after `sha1=` and before `md5=`. Informational — RomVault displays it but does not use it for matching. A warning popup is shown when enabling this option. |
+| **SHA-256** | `sha256=` | Optional. Written after `sha1=` and before `md5=`. Informational — RomVault displays it but does not use it for matching |
 
 Attribute order in the output rom tag follows the RomVault DATReader source exactly:
 `name` → `size` → `crc` → `sha1` → `sha256` → `md5` → `date`
@@ -511,8 +493,7 @@ When **Start** is pressed, a detached **Run Progress** window opens automaticall
 
 **Features:**
 - Live status line, item counts, and progress bar
-- Animated braille spinner during Phase 1 (folder discovery), switching to a determinate progress bar during Phase 2 (hashing)
-- Scrollable activity log — each folder is logged in real time as it is discovered during Phase 1, with colour-coded entries (amber for scan events, blue for folder processing, green for completed dats)
+- Scrollable activity log with colour-coded entries (blue for folder events, green for completed dats)
 - **📋 Show Progress** button in the main window re-opens the progress window if it has been closed — the activity log is preserved until the next run starts
 - **🔍 Preview Dats** button enables in the progress window once a run completes
 - **💾 Save Activity Log** — saves the full log to a text file
@@ -526,32 +507,26 @@ The progress window opens at a fixed position on screen and can be freely moved 
 
 For large collections — particularly those in the hundreds of GB or multi-TB range — rehashing every file on every run is impractical. The incremental update mode allows the tool to update an existing datfile by hashing only new or changed content, carrying forward hash data for everything that hasn't changed.
 
-**Enable it:** Tick **Incremental update — skip already-hashed files** in the Incremental Update section and point the **Existing dat file or folder** field to the dat you want to update (or the folder containing your dats for bulk updates). Optionally tick **Rename superseded dat to .old** to invalidate the previous datfile in RomVault once the update is complete.
+**Enable it:** Tick **Incremental update — skip already-hashed files** in the Dat Settings section and point the **Existing dat file or folder** field to the dat you want to update (or the folder containing your dats for bulk updates).
 
 ### How it works
 
 When Start is pressed with incremental mode active, a **Pre-flight Check** dialog opens before any processing begins:
 
-1. **Validation** — the tool scans the dat source folder recursively and cross-checks each dat's entries against the source file/zip folder. It reports a match percentage per dat, flags missing entries, and identifies new items to be added.
+1. **Validation** — the tool scans the dat source folder recursively and cross-checks each dat's entries against the source file/zip folder. It reports a match percentage per dat and flags anything missing.
 2. **New version** — optionally set a new `<version>` string for the updated dat header.
-3. **Proceed / Rehash entire folder / Rescan Dats / Save Pre-inspection Log / Cancel** — choose how to continue.
-
-### Pre-inspection Log
-
-After validation completes, the **💾 Save Pre-inspection Log** button becomes available. This saves a full timestamped report (`dat_creator_pre-inspection_log_YYYYMMDD_HHMMSS.txt`) listing every anomaly found — every missing game entry, every missing individual rom file, and every new item detected in the source folder that is not yet in the dat. The on-screen dialog shows only summary counts; the log file contains the complete detail for every dat and every affected entry.
+3. **Proceed / Rehash entire folder / Rescan Dats / Cancel** — choose how to continue.
 
 ### Matching strategy
 
 **Zipped mode:** Each zip is checked against the dat using filename + uncompressed size + CRC32 (read from the zip central directory — no decompression needed, takes milliseconds). If all three match, the existing SHA1, MD5, and SHA-256 values are carried forward directly from the dat. Only new or changed zips are fully analyzed.
 
-**Mixed mode:** Files are matched by filename + size only. If both match, existing hash data is carried forward. This applies to all files across all game subfolders — every rom in every game is indexed, not just the first file per game. If a file was replaced with content of the same name and the same size, the change cannot be detected without a full rehash — see the warning in the Pre-flight Check dialog.
-
-**Folder-based Mixed collections** (Structure 3/4 where each game is a subfolder containing multiple files): The incremental engine indexes every rom across every game subfolder. A game is considered fully matched only if its subfolder exists AND every listed rom file is present within it. Individual missing files within a present game folder are reported separately from whole games that are absent.
+**Mixed mode:** Files are matched by filename + size only. If both match, existing hash data is carried forward. If a file was replaced with content of the same name and the same size, the change cannot be detected without a full rehash — see the warning in the Pre-flight Check dialog.
 
 ### After a successful update
 
 - The new datfile is written with today's date in both the filename and the `<date>` header field.
-- If **Rename superseded dat to .old** is ticked, the original datfile is renamed to `filename.xml.old` — this invalidates it from RomVault's perspective while preserving it for reference. If an `.old` file already exists, a numeric suffix is appended (`filename(1).old`, `filename(2).old`, etc.).
+- The original datfile is renamed to `filename.xml.old` — this invalidates it from RomVault's perspective while preserving it for reference. If an `.old` file already exists, a numeric suffix is appended (`filename(1).old`, `filename(2).old`, etc.).
 - There is never more than one active `.xml` datfile in a folder at a time.
 
 ### Validation and path alignment
@@ -568,7 +543,7 @@ Use **🔄 Rescan Dats** inside the Pre-flight Check to re-run validation after 
 
 Available via **Tools → Analyze Folder Structure...** in the menu bar.
 
-If you are unsure which Generation mode or Structure option is appropriate for a collection, the Analyzer can examine the folder layout and make a recommendation before any hashing takes place.
+If you are unsure which Generation mode or Structure option is appropriate for a collection, the Analyzer can examine the folder layout and make a recommendation before any hashing takes place. The Analyzer will give you a better overall understanding of your folders and contents, assisting you in making the best choice for your dat generation.
 
 **How to use:**
 1. Open the Analyzer from the Tools menu
@@ -576,7 +551,7 @@ If you are unsure which Generation mode or Structure option is appropriate for a
 3. Select whether the content is **Mixed** or **Zipped**
 4. Click **Analyze**
 
-The Analyzer walks the folder structure in a background thread (no hashing, completes in seconds even for very large collections with hundreds of thousands of files) and reports:
+The Analyzer walks the folder structure and reports: 
 
 - Total folders and items found
 - Depth distribution — how many levels of subfolders exist
@@ -584,48 +559,20 @@ The Analyzer walks the folder structure in a background thread (no hashing, comp
 - Sample folder names for spot-checking
 - **Recommendation** — a suggested Generation mode and Structure option, colour-coded by confidence level (green = high, amber = medium)
 
+The Analyzer performs no hashing and will complete in seconds for many folder setups. For large amounts of files, it may take a bit longer to parse the file counts. For reference, 1 million files is analyzed in about 45-60 seconds.
+
 Clicking **Apply Recommended Settings** fills the main window's Dat Type, Generation, Structure, Format, and Input folder fields automatically and closes the Analyzer.
 
----
+NOTE:  
+The majority of datfiles use the "1 dat per root folder" generation mode. This is typically chosen for processing up to 3 nested levels deep and keeps the number of dats to a minimum.
 
-## Tools Menu
-
-### Bulk Datfile Header Updater
-
-Available via **Tools → Bulk Datfile Header Updater...**.
-
-Updates the header fields of all datfiles found in a folder (or a single file) in bulk. Particularly useful for updating dates across a folder of dats after content changes, or for correcting author, URL, or category fields across an entire collection.
-
-**Rules:**
-- Leave a field blank → existing content in each dat is left untouched
-- Enter a value → that field is overwritten in every dat
-- Tick **Clear** next to a field → the field is erased (written as an empty tag) in every dat
-- **Date** is always required — updates both the `<date>` header tag and the `(YYYY-MM-DD_RomVault)` token in each filename
-
-The updater runs in a background thread and streams results to the activity log in real time. A log can be saved on completion. Both `.xml` and `.dat` files are processed; subfolders are searched recursively.
-
-### Game and ROM Counter
-
-Available via **Tools → Game and ROM Counter...**.
-
-Scans a folder of datfiles and reports the game count, ROM count, and total uncompressed file size for each dat. Designed to answer the question no ROM manager readily answers: **how many games (not just ROMs) are in each folder?**
-
-**Features:**
-- Recursive folder scan — finds all `.xml` and `.dat` files at any depth
-- Results shown in a hierarchical tree view mirroring the folder structure, with clickable column headers for sorting
-- **Tree View / Flat List** toggle — switch between folder hierarchy and a simple sorted list
-- **Expand / Collapse All** via right-click context menu
-- **Clickable column sort** for Dat Name, Games, ROMs, and Uncompressed Size (▲/▼ toggle, works in both views)
-- **Multi-selection** with Ctrl+click and Shift+click — a live **Selection Subtotal** updates showing combined games, ROMs, size, and average games per dat for the selected rows
-- **Collection Summary** panel — total dats, total folders, total games, total ROMs, total uncompressed size, averages, largest dat by games and by ROMs, empty dat count, and parse error count
-- **Export CSV** — saves all results with raw byte counts for spreadsheet use
-- Sizes reported in decimal MB/GB/TB (not powers-of-2)
+If your folders contain subfolders and a high amount of files, you may prefer to generate a datfile for each individual subfolder by changing your generation mode choice to "1 dat per root folder & all subfolders". This splits up the dats at the per-folder level, provides more content granularity and avoids creating very large individual dats that contain many folders and files.
 
 ---
 
 ## Settings and Config File
 
-All settings are saved to `Eggmans_Datfile_Creator_Suite_config.json` in the same folder as the script. Settings are written automatically when **Start** is pressed and can be explicitly saved at any time with the **Save Settings** button.
+All settings are saved to `Eggmans_Datfile_Creator_config.json` in the same folder as the script. Settings are written automatically when **Start** is pressed and can be explicitly saved at any time with the **Save Settings** button.
 
 The config is plain JSON and can be edited by hand if needed. Unrecognised keys are silently ignored on load, so editing is safe.
 
@@ -694,7 +641,7 @@ Dats at depth 5 and above were without exception large PC or arcade preservation
 
 ### SHA-256 in Datfiles
 
-SHA-256 support was introduced to the Logiqx dat format by No-Intro's Dat-o-Matic database and is present in many No-Intro dats. RomVault will display the SHA-256 value when it exists in a dat, but does not use it as part of its hash matching or ROM verification workflow — CRC32 and SHA1 are the operative hashes. SHA-256 is available as an optional output field in this tool for completeness, but for most collections it adds computation time without practical benefit. A warning popup is shown when enabling SHA-256 to remind users of this.
+SHA-256 support was introduced to the Logiqx dat format by No-Intro's Dat-o-Matic database and is present in many No-Intro dats. RomVault will display the SHA-256 value when it exists in a dat, but does not use it as part of its hash matching or ROM verification workflow — CRC32 and SHA1 are the operative hashes. SHA-256 is available as an optional output field in this tool for completeness, but for most collections it adds computation time without practical benefit.
 
 ---
 
@@ -708,7 +655,7 @@ SHA-256 support was introduced to the Logiqx dat format by No-Intro's Dat-o-Mati
 <?xml version="1.0"?>
 <datafile>
     <header>
-        <n>Digitoxin - Floppy - Access Software PC Floppy Disk Image Collection</n>
+        <name>Digitoxin - Floppy - Access Software PC Floppy Disk Image Collection</name>
         <description>PC Floppy Disk Image Collection</description>
         <category>PC</category>
         <version>2026-04-24</version>
@@ -757,7 +704,7 @@ This distinction matters for RomVault's Fix engine: only `<game>` entries can be
 - **The `forcepacking="unzip"` and `forcepacking="zip"` values are not generated.** Only `fileonly` (Mixed) and absent (Zipped) are produced.
 - **`<softwarelist>` and MAME XML formats are not produced.** These are specialised formats for MAME's internal database and are outside the scope of this tool.
 - **Incremental update Mixed mode cannot detect same-name same-size file replacements.** If a file has been replaced with content of identical filename and size, the change will not be detected. The Pre-flight Check dialog warns of this when Mixed mode is active. A full rehash option is available in the dialog for this scenario.
-- **Per All mode with very large collections may be slow during Phase 1.** The scanner must traverse every folder at every depth. The progress window shows a live spinner and logs each folder as it is discovered, so you can see that the scan is still running. Mixed mode with SHA-256 enabled on large uncompressed files will be the primary Phase 2 bottleneck.
+- **Per All mode with very large collections may be slow.** The scanner must traverse every folder at every depth. Mixed mode with SHA-256 enabled on large uncompressed files will be the primary bottleneck.
 
 ---
 
