@@ -682,7 +682,7 @@ The config is plain JSON and can be edited by hand if needed. Unrecognised keys 
 
 ---
 
-## Advanced: Datfile Landscape Analysis
+# Advanced: Datfile Landscape Analysis
 
 > **This section is for collectors and advanced users curious about the broader datfile ecosystem. None of this is required reading to use the tool.**
 
@@ -749,7 +749,7 @@ SHA-256 support was introduced to the Logiqx dat format by No-Intro's Dat-o-Mati
 
 ---
 
-## Advanced: DAT Format Reference
+# Advanced: DAT Format Reference
 
 > **For users who want to understand exactly what the tool is writing. Skip this if you don't need to hand-edit datfiles.**
 
