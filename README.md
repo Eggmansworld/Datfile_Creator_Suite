@@ -73,7 +73,7 @@ pip install tkinterdnd2
 
 ---
 
-## Installation
+## Python Installation
 
 1. Install Python 3.10 or later from [python.org](https://python.org)
 2. Install 7-Zip-ZStandard from the link above
@@ -90,6 +90,12 @@ pip install tkinterdnd2
 
 The script saves its config file (`Eggmans_Datfile_Creator_Suite_config.json`) in the same directory as the script itself.
 
+## Windows Installation
+
+1. Visit the Releases section of this repository
+2. Download the latest Windows exe
+3. Place it somewhere on your computer
+4. Run the exe.
 ---
 
 ## Quick Start
