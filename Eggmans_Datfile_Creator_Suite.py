@@ -32,7 +32,7 @@ RomVault DAT format (from RVWorld DATReader source):
   - forcepacking absent on Zipped header → RomVault defaults to Zip mode
 """
 
-import os, sys, json, re, time, queue, zlib
+import os, sys, json, re, time, queue, zlib, stat
 import ctypes, hashlib, threading, datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -76,9 +76,23 @@ def xa(value: str) -> str:
 
 
 def script_dir() -> str:
+    """Returns the directory of the script/exe — used for config file location."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def resource_path(filename: str) -> str:
+    """
+    Returns the full path to a bundled resource file.
+
+    When running as a PyInstaller --onefile exe, data files are extracted
+    to a temporary sys._MEIPASS directory, NOT the exe's own directory.
+    When running as a plain .py script, resources live beside the script.
+    """
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return os.path.join(sys._MEIPASS, filename)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
 
 
 def safe_makedirs(path: str) -> Optional[str]:
@@ -1528,6 +1542,16 @@ class App:
         tools_menu.add_command(
             label="Game and ROM Counter...",
             command=self.open_game_rom_counter)
+        tools_menu.add_separator()
+        tools_menu.add_command(
+            label="Recursive Archive Extractor...",
+            command=self.open_archive_extractor)
+        tools_menu.add_command(
+            label="ZIP Store Packer...",
+            command=self.open_zip_packer)
+        tools_menu.add_command(
+            label="Remove ReadOnly Attribute...",
+            command=self.open_remove_readonly)
         menubar.add_cascade(label="Tools", menu=tools_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0,
@@ -1553,6 +1577,15 @@ class App:
     def open_game_rom_counter(self):
         GameRomCounterWindow(self.root, self)
 
+    def open_archive_extractor(self):
+        RecursiveArchiveExtractorWindow(self.root, self)
+
+    def open_zip_packer(self):
+        ZipStorePackerWindow(self.root, self)
+
+    def open_remove_readonly(self):
+        RemoveReadOnlyWindow(self.root, self)
+
     def show_about(self):
         win = tk.Toplevel(self.root)
         win.title("About — Eggman's Datfile Creator Suite")
@@ -1561,7 +1594,7 @@ class App:
         win.grab_set()
 
         # Banner image (optional — silently skipped if file not found)
-        banner_path = os.path.join(script_dir(), "Eggmans_Datfile_Creator_Suite_banner.png")
+        banner_path = resource_path("Eggmans_Datfile_Creator_Suite_banner.png")
         if os.path.isfile(banner_path):
             try:
                 img = tk.PhotoImage(file=banner_path)
@@ -5354,6 +5387,1134 @@ class GameRomCounterWindow(tk.Toplevel):
             messagebox.showinfo("Exported", f"CSV saved to:\n{p}", parent=self)
         except Exception as exc:
             messagebox.showerror("Error", repr(exc), parent=self)
+
+
+# This file is spliced in before ENTRY POINT
+
+# ── Optional: send2trash for Recycle Bin support in Archive Extractor ─────────
+try:
+    import send2trash as _au_send2trash
+    _AU_TRASH_AVAILABLE = True
+except ImportError:
+    _au_send2trash = None
+    _AU_TRASH_AVAILABLE = False
+
+# ── Archive Utilities core library (prefixed _au_) ────────────────────────────
+
+import zipfile as _au_zipfile
+import shutil  as _au_shutil
+import subprocess as _au_subprocess
+import stat    as _au_stat
+from pathlib import Path as _au_Path
+from collections import deque as _au_deque
+from datetime import timedelta as _au_timedelta
+
+_AU_INVALID_WIN_CHARS = r'<>:"/\|?*'
+
+
+def _au_run_7z(sevenzip_path: str, args: list):
+    p = _au_subprocess.run(
+        [sevenzip_path] + args,
+        stdout=_au_subprocess.PIPE, stderr=_au_subprocess.PIPE,
+        text=True, errors="replace")
+    return p.returncode, p.stdout, p.stderr
+
+
+def _au_sanitize(name: str) -> str:
+    import re as _re2
+    name = _re2.sub(f"[{_re2.escape(_AU_INVALID_WIN_CHARS)}]", "_", name)
+    return name.rstrip(" .") or "extracted"
+
+
+def _au_classify_zip_native(path):
+    try:
+        with _au_zipfile.ZipFile(path, "r") as zf:
+            infos = zf.infolist()
+    except Exception:
+        return "bad", None
+    files, has_dir = [], False
+    for info in infos:
+        n = info.filename
+        if n.endswith("/"): has_dir = True; continue
+        if "/" in n: has_dir = True
+        files.append(n)
+    if len(files) == 1 and not has_dir and "/" not in files[0]:
+        return "single", files[0]
+    return "folder", None
+
+
+def _au_classify_via_7z(path, sevenzip_path: str):
+    rc, _, _ = _au_run_7z(sevenzip_path, ["l", str(path)])
+    return ("bad", None) if rc != 0 else ("folder", None)
+
+
+def _au_classify(path, sevenzip_path: str):
+    ext = _au_Path(path).suffix.lower()
+    return _au_classify_zip_native(path) if ext == ".zip" \
+        else _au_classify_via_7z(path, sevenzip_path)
+
+
+def _au_merge_dir(src, dst):
+    for item in src.iterdir():
+        d = dst / item.name
+        if d.exists():
+            if d.is_dir() and item.is_dir():
+                _au_merge_dir(item, d)
+                _au_shutil.rmtree(item, ignore_errors=True)
+            else:
+                (d if d.is_dir() else d).unlink(missing_ok=True) \
+                    if not d.is_dir() else _au_shutil.rmtree(d, ignore_errors=True)
+                _au_shutil.move(str(item), str(d))
+        else:
+            _au_shutil.move(str(item), str(d))
+
+
+def _au_flatten_double_nest(target):
+    children = list(target.iterdir())
+    if len(children) != 1: return
+    only = children[0]
+    if not only.is_dir() or only.name != target.name: return
+    _au_merge_dir(only, target)
+    _au_shutil.rmtree(only, ignore_errors=True)
+
+
+def _au_extract_single(archive, out_dir, sevenzip_path: str):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rc, _, err = _au_run_7z(sevenzip_path, ["e", "-y", f"-o{out_dir}", str(archive)])
+    return rc == 0, err.strip()
+
+
+def _au_extract_to_folder(archive, target, sevenzip_path: str):
+    target.mkdir(parents=True, exist_ok=True)
+    tmp = target / "__tmp_extract__"
+    if tmp.exists(): _au_shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True, exist_ok=True)
+    rc, _, err = _au_run_7z(sevenzip_path, ["x", "-y", f"-o{tmp}", str(archive)])
+    if rc != 0:
+        _au_shutil.rmtree(tmp, ignore_errors=True)
+        return False, err.strip()
+    _au_merge_dir(tmp, target)
+    _au_shutil.rmtree(tmp, ignore_errors=True)
+    _au_flatten_double_nest(target)
+    return True, ""
+
+
+def _au_delete_archive(path, mode: str):
+    if mode == "keep": return True, ""
+    if mode == "recycle":
+        if not _AU_TRASH_AVAILABLE: return False, "send2trash not installed"
+        try: _au_send2trash.send2trash(str(path)); return True, ""
+        except Exception as e: return False, str(e)
+    try: _au_Path(path).unlink(); return True, ""
+    except Exception as e: return False, str(e)
+
+
+def _au_move_mirrored(archive, src_root, move_root):
+    try:
+        rel  = archive.relative_to(src_root)
+        dest = move_root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _au_shutil.move(str(archive), str(dest))
+        return True, str(dest)
+    except Exception as e: return False, str(e)
+
+
+def _au_move_flat(archive, move_root):
+    try:
+        move_root.mkdir(parents=True, exist_ok=True)
+        dest = move_root / archive.name
+        stem, suffix, n = archive.stem, archive.suffix, 1
+        while dest.exists():
+            dest = move_root / f"{stem}({n}){suffix}"; n += 1
+        _au_shutil.move(str(archive), str(dest))
+        return True, str(dest)
+    except Exception as e: return False, str(e)
+
+
+def _au_scan_for_archives(folder, exts: set) -> list:
+    found = []
+    for ext in exts:
+        found.extend(folder.rglob(f"*{ext}"))
+    return sorted(found)
+
+
+# ── Shared widgets (Suite-themed) ─────────────────────────────────────────────
+
+class _ArchiveFolderPicker(tk.Frame):
+    """Drop zone + entry + browse button, Suite-themed."""
+
+    def __init__(self, parent, app, label="Drop folder here — or Browse →",
+                 disabled=False, **kwargs):
+        c = app._c
+        super().__init__(parent, bg=c["options"], **kwargs)
+        self._c = c
+        self._disabled = disabled
+        self._var = tk.StringVar()
+
+        state   = "disabled" if disabled else "normal"
+        zone_bg = c["entry"] if not disabled else c["options"]
+
+        self.zone = tk.Label(self, text=label,
+                             bg=zone_bg, fg="#5A5A5A",
+                             font=("Segoe UI", 9),
+                             pady=6, cursor="hand2" if not disabled else "",
+                             relief="flat", anchor="w", padx=8)
+        self.zone.pack(fill="x", pady=(0, 3))
+        if not disabled:
+            self.zone.bind("<Button-1>", lambda e: self._browse())
+
+        row = tk.Frame(self, bg=c["options"])
+        row.pack(fill="x")
+        row.columnconfigure(0, weight=1)
+
+        self.entry = ttk.Entry(row, textvariable=self._var, state=state)
+        self.entry.grid(row=0, column=0, sticky="ew")
+
+        self.btn = ttk.Button(row, text="Browse...", style="Browse.TButton",
+                              command=self._browse, state=state)
+        self.btn.grid(row=0, column=1, padx=(4, 0))
+
+        if not disabled:
+            try:
+                self.zone.drop_target_register(DND_FILES)
+                self.zone.dnd_bind("<<Drop>>", self._on_drop)
+                self.entry.drop_target_register(DND_FILES)
+                self.entry.dnd_bind("<<Drop>>", self._on_drop)
+            except Exception:
+                pass
+
+    def _browse(self):
+        d = filedialog.askdirectory()
+        if d: self.set(d)
+
+    def _on_drop(self, event):
+        p = clean_dnd_path(event.data)
+        if p and os.path.isdir(p): self.set(p)
+        return event.action
+
+    def set(self, path: str):
+        self._var.set(path)
+        name = _au_Path(path).name if path else ""
+        self.zone.config(
+            text=("📂  " + name) if name else "Drop folder here — or Browse →",
+            fg="#1A4A7A" if name else "#5A5A5A")
+
+    def enable(self, yes: bool):
+        state = "normal" if yes else "disabled"
+        self.entry.configure(state=state)
+        self.btn.configure(state=state)
+        self.zone.config(cursor="hand2" if yes else "")
+        if yes: self.zone.bind("<Button-1>", lambda e: self._browse())
+        else:   self.zone.unbind("<Button-1>")
+
+    def get(self) -> str:
+        return self._var.get().strip()
+
+
+class _ArchiveLogPane(tk.Frame):
+    """Scrollable log text widget, Suite-themed."""
+    COLORS = {
+        "ok":     "#1A6A2A",
+        "fail":   "#8A1A1A",
+        "warn":   "#8A5A00",
+        "info":   "#1E90FF",
+        "mute":   "#5A5A5A",
+        "skip":   "#5A5A5A",
+        "nested": "#7A5A9A",
+    }
+
+    def __init__(self, parent, app, **kwargs):
+        c = app._c
+        super().__init__(parent, bg=c["list"], **kwargs)
+        self._app = app
+
+        self.text = tk.Text(self, bg=c["list"], fg=c["fg"],
+                            font=("Consolas", 9), relief="flat", bd=0,
+                            state="disabled", wrap="none", height=8)
+        vsb = ttk.Scrollbar(self, orient="vertical",   command=self.text.yview)
+        hsb = ttk.Scrollbar(self, orient="horizontal", command=self.text.xview)
+        self.text.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.text.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        for tag, color in self.COLORS.items():
+            self.text.tag_configure(tag, foreground=color)
+        self.text.tag_configure("nested", foreground="#7A5A9A",
+                                font=("Consolas", 9, "bold"))
+
+    def write(self, tag: str, msg: str):
+        def _do():
+            self.text.config(state="normal")
+            self.text.insert("end", msg, tag)
+            self.text.see("end")
+            self.text.config(state="disabled")
+        self.after(0, _do)
+
+    def clear(self):
+        self.text.config(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.config(state="disabled")
+
+    def save(self):
+        content = self.text.get("1.0", "end").strip()
+        if not content: return
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        p = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            initialfile=f"archive_utility_log_{ts}.txt")
+        if p:
+            _au_Path(p).write_text(content, encoding="utf-8")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  RECURSIVE ARCHIVE EXTRACTOR WINDOW
+# ═══════════════════════════════════════════════════════════════════════════
+
+class RecursiveArchiveExtractorWindow(tk.Toplevel):
+    """
+    Recursive ZIP / 7Z / RAR extraction tool.
+    Adapted from Eggman's Archive Utilities v2.0, Suite-themed.
+    """
+
+    def __init__(self, root_win, app):
+        super().__init__(root_win)
+        self.app   = app
+        self._c    = app._c
+        self._stop = False
+        self.title("Eggman's Datfile Creator Suite — Recursive Archive Extractor")
+        self.geometry("920x860+175+175")
+        self.minsize(760, 600)
+        self.configure(bg=self._c["options"])
+        self._build_ui()
+        self.grab_set()
+
+    def _build_ui(self):
+        c   = self._c
+        PAD = 8
+
+        # ── Description ───────────────────────────────────────────────────────
+        inst_lf = ttk.LabelFrame(self, text="  Recursive Archive Extractor  ",
+                                  style="Paths.TLabelframe", padding=PAD)
+        inst_lf.pack(fill="x", padx=PAD, pady=(PAD, 0))
+        tk.Label(inst_lf,
+                 text="Recursively extracts ZIP, 7Z, and RAR archives into their own named "
+                      "subfolders. Detects archives nested inside extracted content and can "
+                      "auto-extract them in the same pass. Extracted archives can be kept, "
+                      "recycled, permanently deleted, or moved to a separate location.\n"
+                      "Uses the 7-Zip-ZStandard path configured in the main Suite settings.",
+                 bg=c["paths"], fg=c["fg"], font=("Segoe UI", 9),
+                 wraplength=860, justify="left", anchor="w").pack(fill="x")
+
+        if not _AU_TRASH_AVAILABLE:
+            tk.Label(inst_lf,
+                     text="⚠  Recycle Bin option unavailable — install send2trash: "
+                          "pip install send2trash",
+                     bg=c["paths"], fg="#8A5A00",
+                     font=("Segoe UI", 8)).pack(anchor="w")
+
+        # ── Source ────────────────────────────────────────────────────────────
+        src_lf = ttk.LabelFrame(self, text="  Source Folder  ",
+                                  style="Options.TLabelframe", padding=PAD)
+        src_lf.pack(fill="x", padx=PAD, pady=(4, 0))
+        self.src = _ArchiveFolderPicker(src_lf, self.app)
+        self.src.pack(fill="x")
+
+        # ── Destination ───────────────────────────────────────────────────────
+        dst_lf = ttk.LabelFrame(self, text="  Destination  ",
+                                  style="Header.TLabelframe", padding=PAD)
+        dst_lf.pack(fill="x", padx=PAD, pady=(4, 0))
+
+        mode_row = tk.Frame(dst_lf, bg=c["header"])
+        mode_row.pack(fill="x", pady=(0, 4))
+        self.dst_mode = tk.StringVar(value="same")
+        for text, val in [("Same as source", "same"),
+                           ("Mirror to custom destination", "custom")]:
+            tk.Radiobutton(mode_row, text=text, variable=self.dst_mode, value=val,
+                           bg=c["header"], fg=c["fg"], selectcolor=c["entry"],
+                           activebackground=c["header"], font=("Segoe UI", 9),
+                           command=self._on_dst_mode).pack(side="left", padx=(0, 14))
+
+        self.dst = _ArchiveFolderPicker(dst_lf, self.app,
+                                         label="Drop destination root here — or Browse →",
+                                         disabled=True)
+        self.dst.pack(fill="x")
+        tk.Label(dst_lf,
+                 text="  Mirror example:  D:\\source\\sub\\file.zip  →  E:\\dest\\source\\sub\\file\\",
+                 bg=c["header"], fg="#5A5A5A", font=("Segoe UI", 8, "italic")).pack(anchor="w")
+
+        # ── Options ───────────────────────────────────────────────────────────
+        opt_lf = ttk.LabelFrame(self, text="  Options  ",
+                                  style="Options.TLabelframe", padding=PAD)
+        opt_lf.pack(fill="x", padx=PAD, pady=(4, 0))
+
+        row1 = tk.Frame(opt_lf, bg=c["options"])
+        row1.pack(fill="x", pady=(0, 2))
+        tk.Label(row1, text="Formats:", bg=c["options"], fg=c["fg"],
+                 font=("Segoe UI", 9)).pack(side="left")
+
+        self.fmt_zip = tk.BooleanVar(value=True)
+        self.fmt_7z  = tk.BooleanVar(value=True)
+        self.fmt_rar = tk.BooleanVar(value=True)
+        for var, lbl in [(self.fmt_zip, ".zip"), (self.fmt_7z, ".7z"),
+                          (self.fmt_rar, ".rar")]:
+            tk.Checkbutton(row1, text=lbl, variable=var,
+                           bg=c["options"], fg=c["fg"], selectcolor=c["entry"],
+                           activebackground=c["options"],
+                           font=("Segoe UI", 9)).pack(side="left", padx=(8, 0))
+
+        self.recurse_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(row1, text="Recursive", variable=self.recurse_var,
+                       bg=c["options"], fg=c["fg"], selectcolor=c["entry"],
+                       activebackground=c["options"],
+                       font=("Segoe UI", 9)).pack(side="left", padx=(24, 0))
+
+        self.nested_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row1, text="Auto-extract nested archives",
+                       variable=self.nested_var,
+                       bg=c["options"], fg="#7A5A9A", selectcolor=c["entry"],
+                       activebackground=c["options"],
+                       font=("Segoe UI", 9, "bold")).pack(side="left", padx=(24, 0))
+
+        row2a = tk.Frame(opt_lf, bg=c["options"])
+        row2a.pack(fill="x", pady=(0, 2))
+        tk.Label(row2a, text="After extraction:", bg=c["options"], fg=c["fg"],
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.after_mode = tk.StringVar(value="keep")
+        after_opts = [("Keep archive", "keep", c["fg"]),
+                      ("→ Recycle Bin", "recycle", "#1E6A4A"),
+                      ("→ Permanent delete", "permanent", "#8A5A00")]
+        for txt, val, fg in after_opts:
+            state = "normal"
+            if val == "recycle" and not _AU_TRASH_AVAILABLE:
+                state = "disabled"; txt += " (send2trash missing)"
+            tk.Radiobutton(row2a, text=txt, variable=self.after_mode, value=val,
+                           bg=c["options"], fg=fg, selectcolor=c["entry"],
+                           activebackground=c["options"], font=("Segoe UI", 9),
+                           state=state, command=self._on_after_mode).pack(
+                               side="left", padx=(10, 0))
+
+        row2b = tk.Frame(opt_lf, bg=c["options"])
+        row2b.pack(fill="x")
+        tk.Label(row2b, text=" " * 17, bg=c["options"]).pack(side="left")
+        for txt, val in [("→ Move (mirror structure)", "move_mirror"),
+                          ("→ Move (flat dump)", "move_flat")]:
+            tk.Radiobutton(row2b, text=txt, variable=self.after_mode, value=val,
+                           bg=c["options"], fg="#1A6A2A", selectcolor=c["entry"],
+                           activebackground=c["options"], font=("Segoe UI", 9),
+                           command=self._on_after_mode).pack(side="left", padx=(10, 0))
+
+        self.move_dst_frame = tk.Frame(opt_lf, bg=c["options"])
+        tk.Label(self.move_dst_frame, text="  Move destination:",
+                 bg=c["options"], fg=c["fg"],
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(4, 0))
+        self.move_dst = _ArchiveFolderPicker(
+            self.move_dst_frame, self.app,
+            label="Drop move-destination folder here — or Browse →")
+        self.move_dst.pack(fill="x")
+
+        # ── Status + Progress ─────────────────────────────────────────────────
+        stat_row = tk.Frame(self, bg=self._c["buttons"])
+        stat_row.pack(fill="x", padx=PAD, pady=(4, 1))
+        self.stat_var = tk.StringVar(value="Ready.")
+        ttk.Label(stat_row, textvariable=self.stat_var,
+                  background=self._c["buttons"],
+                  foreground="#5A5A5A",
+                  font=("Segoe UI", 8, "italic")).pack(side="left")
+
+        self.progress = ttk.Progressbar(self, mode="determinate", maximum=100)
+        self.progress.pack(fill="x", padx=PAD, pady=(1, 4))
+
+        # ── Log ───────────────────────────────────────────────────────────────
+        log_lf = ttk.LabelFrame(self, text="  Activity Log  ",
+                                  style="Progress.TLabelframe", padding=4)
+        log_lf.pack(fill="both", expand=True, padx=PAD, pady=(0, 4))
+        self.log = _ArchiveLogPane(log_lf, self.app)
+        self.log.pack(fill="both", expand=True)
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        bot = ttk.Frame(self, style="Buttons.TFrame", padding=(PAD, 4))
+        bot.pack(fill="x", pady=(0, PAD))
+
+        self.start_btn = ttk.Button(bot, text="▶  Extract",
+                                     style="Start.TButton",
+                                     command=self._start)
+        self.start_btn.pack(side="left")
+
+        self.stop_btn = ttk.Button(bot, text="⏹  Stop",
+                                    style="HardStop.TButton",
+                                    command=lambda: setattr(self, "_stop", True),
+                                    state="disabled")
+        self.stop_btn.pack(side="left", padx=(8, 0))
+
+        ttk.Button(bot, text="💾  Save Log", style="Log.TButton",
+                   command=self.log.save).pack(side="right")
+        ttk.Button(bot, text="Clear Log", style="Browse.TButton",
+                   command=self.log.clear).pack(side="right", padx=(0, 8))
+
+    def _on_dst_mode(self):
+        self.dst.enable(self.dst_mode.get() == "custom")
+
+    def _on_after_mode(self):
+        is_move = self.after_mode.get() in ("move_mirror", "move_flat")
+        if is_move: self.move_dst_frame.pack(fill="x", padx=8, pady=(0, 4))
+        else:       self.move_dst_frame.pack_forget()
+
+    def _stat(self, msg):
+        self.after(0, lambda: self.stat_var.set(msg))
+
+    def _prog(self, val):
+        self.after(0, lambda: self.progress.config(value=val))
+
+    def _start(self):
+        sevenzip = self.app._read_settings().sevenzip_path
+        if not os.path.isfile(sevenzip):
+            messagebox.showerror("7z not found",
+                                 f"7z.exe not found at:\n{sevenzip}\n\n"
+                                 "Check the 7-Zip-ZStandard path in Suite settings.",
+                                 parent=self)
+            return
+
+        src_path = self.src.get()
+        if not src_path or not _au_Path(src_path).is_dir():
+            self.log.write("fail", "ERROR: Source folder not set or does not exist.\n")
+            return
+
+        custom_dst = None
+        if self.dst_mode.get() == "custom":
+            custom_dst = self.dst.get()
+            if not custom_dst:
+                self.log.write("fail", "ERROR: Custom destination not set.\n"); return
+
+        after = self.after_mode.get()
+        move_root = None
+        if after in ("move_mirror", "move_flat"):
+            move_root = self.move_dst.get()
+            if not move_root:
+                self.log.write("fail", "ERROR: Move destination not set.\n"); return
+            move_root = _au_Path(move_root)
+
+        exts = set()
+        if self.fmt_zip.get(): exts.add(".zip")
+        if self.fmt_7z.get():  exts.add(".7z")
+        if self.fmt_rar.get(): exts.add(".rar")
+        if not exts:
+            self.log.write("fail", "ERROR: No formats selected.\n"); return
+
+        self._stop = False
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+
+        threading.Thread(
+            target=self._run,
+            args=(sevenzip, _au_Path(src_path),
+                  _au_Path(custom_dst) if custom_dst else None,
+                  exts, after, move_root,
+                  self.recurse_var.get(), self.nested_var.get()),
+            daemon=True).start()
+
+    def _run(self, sevenzip, src_root, dst_root, exts, after_mode,
+             move_root, recurse, auto_nested):
+        t0 = time.time()
+        initial = []
+        for ext in exts:
+            initial.extend(src_root.rglob(f"*{ext}") if recurse
+                           else src_root.glob(f"*{ext}"))
+        initial = sorted(set(initial))
+
+        if not initial:
+            self.log.write("info", f"No archives found under: {src_root}\n")
+            self._finish(); return
+
+        queue      = _au_deque(initial)
+        queued_set = set(initial)
+        total_seen = len(initial)
+        processed  = 0
+
+        self.log.write("info", f"Found {total_seen} archive(s) under: {src_root}\n")
+        if dst_root:   self.log.write("info", f"Extract destination: {dst_root}\n")
+        if move_root:
+            label = "mirror" if after_mode == "move_mirror" else "flat"
+            self.log.write("info", f"Move destination ({label}): {move_root}\n")
+        if auto_nested: self.log.write("info", "Auto-extract nested: ON\n")
+        self.log.write("info", "─" * 64 + "\n")
+
+        ok = fail = bad = nested_total = 0
+
+        while queue and not self._stop:
+            arc = queue.popleft()
+            processed += 1
+            elapsed = time.time() - t0
+            rate    = processed / elapsed if elapsed > 0 else 0
+            remain  = len(queue)
+            eta     = remain / rate if rate > 0 else 0
+            self._stat(
+                f"{processed}/{total_seen}  (+{remain} queued)  |  "
+                f"OK:{ok}  Fail:{fail}  |  "
+                f"{_au_timedelta(seconds=int(elapsed))} elapsed  "
+                f"ETA {_au_timedelta(seconds=int(eta))}")
+            self._prog(min(99, 100 * processed / total_seen))
+
+            mode, _ = _au_classify(arc, sevenzip)
+            if mode == "bad":
+                self.log.write("mute", f"[BAD]   {arc}\n"); bad += 1; continue
+
+            try:
+                rel_parent = arc.relative_to(src_root).parent
+                under_src  = True
+            except ValueError:
+                rel_parent = _au_Path("."); under_src = False
+
+            if dst_root is not None and under_src:
+                out_dir = dst_root / src_root.name / rel_parent \
+                    if mode == "single" \
+                    else dst_root / src_root.name / rel_parent / _au_sanitize(arc.stem)
+            else:
+                out_dir = arc.parent if mode == "single" \
+                    else arc.parent / _au_sanitize(arc.stem)
+
+            if mode == "single":
+                ok_ex, err = _au_extract_single(arc, out_dir, sevenzip)
+            else:
+                ok_ex, err = _au_extract_to_folder(arc, out_dir, sevenzip)
+
+            if not ok_ex:
+                self.log.write("fail", f"[FAIL]  {arc.name}\n        {err}\n")
+                fail += 1; continue
+
+            nested_found = _au_scan_for_archives(out_dir, exts)
+            if nested_found:
+                nested_total += len(nested_found)
+                self.log.write("nested",
+                    f"{'▼'*60}\n"
+                    f"  ⚠  NESTED ARCHIVES in: {out_dir.name}\n"
+                    f"  ↳  {len(nested_found)} archive(s) after extracting {arc.name}\n")
+                for nf in nested_found:
+                    if auto_nested and nf not in queued_set:
+                        queued_set.add(nf); queue.append(nf); total_seen += 1
+                        self.log.write("nested", f"       [QUEUED]  {nf.name}\n")
+                    else:
+                        action = "(already queued)" if nf in queued_set \
+                            else "(not auto-extracting)"
+                        self.log.write("nested", f"       [FOUND]   {nf.name}  {action}\n")
+                self.log.write("nested", f"{'▼'*60}\n")
+
+            if after_mode == "keep":
+                suffix, tag = "", "ok"
+            elif after_mode == "recycle":
+                ok_d, ed = _au_delete_archive(arc, "recycle")
+                suffix, tag = ("  [recycled]" if ok_d else f"  [recycle WARN: {ed}]",
+                               "ok" if ok_d else "warn")
+            elif after_mode == "permanent":
+                ok_d, ed = _au_delete_archive(arc, "permanent")
+                suffix, tag = ("  [deleted]" if ok_d else f"  [delete WARN: {ed}]",
+                               "ok" if ok_d else "warn")
+            elif after_mode == "move_mirror":
+                ok_d, de = _au_move_mirrored(arc, src_root, move_root)
+                suffix, tag = ((f"  [→ {de}]" if ok_d else f"  [move WARN: {de}]"),
+                               "ok" if ok_d else "warn")
+            elif after_mode == "move_flat":
+                ok_d, de = _au_move_flat(arc, move_root)
+                suffix, tag = ((f"  [→ {de}]" if ok_d else f"  [move WARN: {de}]"),
+                               "ok" if ok_d else "warn")
+            else:
+                suffix, tag = "", "ok"
+
+            self.log.write(tag, f"[OK]    {arc.name}  →  {out_dir}{suffix}\n")
+            ok += 1
+
+        if self._stop:
+            self.log.write("warn", f"[STOPPED — {len(queue)} remaining]\n")
+
+        elapsed = time.time() - t0
+        self.log.write("info", "─" * 64 + "\n")
+        nn = f"  |  Nested alerts: {nested_total}" if nested_total else ""
+        self.log.write("info",
+            f"Done.  OK: {ok}  Fail: {fail}  Bad: {bad}{nn}  |  "
+            f"{_au_timedelta(seconds=int(elapsed))}\n")
+        self._stat(f"Done — OK:{ok}  Fail:{fail}  Bad:{bad}")
+        self._prog(100)
+        self._finish()
+
+    def _finish(self):
+        self.after(0, lambda: self.start_btn.configure(state="normal"))
+        self.after(0, lambda: self.stop_btn.configure(state="disabled"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ZIP STORE PACKER WINDOW
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ZipStorePackerWindow(tk.Toplevel):
+    """
+    Wraps files in uncompressed ZIP_STORED containers.
+    Adapted from Eggman's Archive Utilities v2.0, Suite-themed.
+    """
+
+    def __init__(self, root_win, app):
+        super().__init__(root_win)
+        self.app   = app
+        self._c    = app._c
+        self._stop = False
+        self._exts: list = []
+        self.title("Eggman's Datfile Creator Suite — ZIP Store Packer")
+        self.geometry("780x720+200+200")
+        self.minsize(640, 520)
+        self.configure(bg=self._c["options"])
+        self._build_ui()
+        self.grab_set()
+
+    def _build_ui(self):
+        c   = self._c
+        PAD = 8
+
+        # ── Description ───────────────────────────────────────────────────────
+        inst_lf = ttk.LabelFrame(self, text="  ZIP Store Packer  ",
+                                  style="Paths.TLabelframe", padding=PAD)
+        inst_lf.pack(fill="x", padx=PAD, pady=(PAD, 0))
+        tk.Label(inst_lf,
+                 text="Wraps files in uncompressed ZIP containers (ZIP_STORED — zero "
+                      "compression) for use as a neutral byte-preserving wrapper before "
+                      "downstream recompression by RomVault or other tools. Each source "
+                      "file is verified inside its zip before the original is deleted. "
+                      "Target extensions are configurable; existing zips are skipped by default.",
+                 bg=c["paths"], fg=c["fg"], font=("Segoe UI", 9),
+                 wraplength=720, justify="left", anchor="w").pack(fill="x")
+
+        # ── Source ────────────────────────────────────────────────────────────
+        src_lf = ttk.LabelFrame(self, text="  Target Folder  ",
+                                  style="Options.TLabelframe", padding=PAD)
+        src_lf.pack(fill="x", padx=PAD, pady=(4, 0))
+        self.src = _ArchiveFolderPicker(src_lf, self.app)
+        self.src.pack(fill="x")
+
+        # ── Extensions ────────────────────────────────────────────────────────
+        ext_lf = ttk.LabelFrame(self, text="  Target Extensions  ",
+                                  style="Header.TLabelframe", padding=PAD)
+        ext_lf.pack(fill="x", padx=PAD, pady=(4, 0))
+
+        add_row = tk.Frame(ext_lf, bg=c["header"])
+        add_row.pack(fill="x", pady=(0, 4))
+        self.ext_entry = ttk.Entry(add_row, width=22)
+        self.ext_entry.pack(side="left")
+        self.ext_entry.insert(0, "exe")
+        self.ext_entry.bind("<Return>", lambda e: self._add_ext())
+        ttk.Button(add_row, text="Add", style="Browse.TButton",
+                   command=self._add_ext).pack(side="left", padx=(6, 0))
+        tk.Label(add_row, text="space/comma separated — e.g.  exe dll bin rom",
+                 bg=c["header"], fg="#5A5A5A",
+                 font=("Segoe UI", 8, "italic")).pack(side="left", padx=10)
+
+        self.pill_frame = tk.Frame(ext_lf, bg=c["header"])
+        self.pill_frame.pack(fill="x", pady=(0, 2))
+        self._add_ext_internal(".exe")
+
+        # ── Options ───────────────────────────────────────────────────────────
+        opt_lf = ttk.LabelFrame(self, text="  Options  ",
+                                  style="Options.TLabelframe", padding=PAD)
+        opt_lf.pack(fill="x", padx=PAD, pady=(4, 0))
+        row = tk.Frame(opt_lf, bg=c["options"])
+        row.pack(fill="x")
+        self.recurse_var = tk.BooleanVar(value=True)
+        self.verify_var  = tk.BooleanVar(value=True)
+        self.skip_var    = tk.BooleanVar(value=True)
+        for var, lbl in [(self.recurse_var, "Recursive"),
+                          (self.verify_var,  "Verify before delete"),
+                          (self.skip_var,    "Skip if .zip already exists")]:
+            tk.Checkbutton(row, text=lbl, variable=var,
+                           bg=c["options"], fg=c["fg"], selectcolor=c["entry"],
+                           activebackground=c["options"],
+                           font=("Segoe UI", 9)).pack(side="left", padx=(0, 18))
+
+        # ── Status + Progress ─────────────────────────────────────────────────
+        stat_row = tk.Frame(self, bg=c["buttons"])
+        stat_row.pack(fill="x", padx=PAD, pady=(6, 1))
+        self.stat_var = tk.StringVar(value="Ready.")
+        ttk.Label(stat_row, textvariable=self.stat_var,
+                  background=c["buttons"], foreground="#5A5A5A",
+                  font=("Segoe UI", 8, "italic")).pack(side="left")
+
+        self.progress = ttk.Progressbar(self, mode="determinate", maximum=100)
+        self.progress.pack(fill="x", padx=PAD, pady=(1, 4))
+
+        # ── Log ───────────────────────────────────────────────────────────────
+        log_lf = ttk.LabelFrame(self, text="  Activity Log  ",
+                                  style="Progress.TLabelframe", padding=4)
+        log_lf.pack(fill="both", expand=True, padx=PAD, pady=(0, 4))
+        self.log = _ArchiveLogPane(log_lf, self.app)
+        self.log.pack(fill="both", expand=True)
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        bot = ttk.Frame(self, style="Buttons.TFrame", padding=(PAD, 4))
+        bot.pack(fill="x", pady=(0, PAD))
+        self.start_btn = ttk.Button(bot, text="▶  Pack",
+                                     style="Start.TButton", command=self._start)
+        self.start_btn.pack(side="left")
+        self.stop_btn = ttk.Button(bot, text="⏹  Stop",
+                                    style="HardStop.TButton",
+                                    command=lambda: setattr(self, "_stop", True),
+                                    state="disabled")
+        self.stop_btn.pack(side="left", padx=(8, 0))
+        ttk.Button(bot, text="💾  Save Log", style="Log.TButton",
+                   command=self.log.save).pack(side="right")
+        ttk.Button(bot, text="Clear Log", style="Browse.TButton",
+                   command=self.log.clear).pack(side="right", padx=(0, 8))
+
+    def _add_ext(self):
+        import re as _re3
+        raw = self.ext_entry.get()
+        for tok in _re3.split(r"[\s,]+", raw):
+            tok = tok.strip().lstrip(".")
+            if tok: self._add_ext_internal("." + tok.lower())
+        self.ext_entry.delete(0, "end")
+
+    def _add_ext_internal(self, ext: str):
+        if ext in self._exts: return
+        self._exts.append(ext)
+        c = self._c
+        pill = tk.Frame(self.pill_frame, bg=c["incr"], padx=6, pady=2)
+        pill.pack(side="left", padx=(0, 5), pady=3)
+        tk.Label(pill, text=ext, bg=c["incr"], fg=c["fg"],
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        x = tk.Label(pill, text=" ✕", bg=c["incr"], fg=c["fg"],
+                     font=("Segoe UI", 9), cursor="hand2")
+        x.pack(side="left")
+        x.bind("<Button-1>", lambda e, p=pill, ex=ext: self._remove_ext(p, ex))
+
+    def _remove_ext(self, pill, ext: str):
+        if ext in self._exts: self._exts.remove(ext)
+        pill.destroy()
+
+    def _stat(self, msg):
+        self.after(0, lambda: self.stat_var.set(msg))
+
+    def _prog(self, val):
+        self.after(0, lambda: self.progress.config(value=val))
+
+    def _start(self):
+        src_path = self.src.get()
+        if not src_path or not _au_Path(src_path).is_dir():
+            self.log.write("fail", "ERROR: Target folder not set or does not exist.\n"); return
+        if not self._exts:
+            self.log.write("fail", "ERROR: No extensions configured.\n"); return
+        self._stop = False
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        threading.Thread(
+            target=self._run,
+            args=(_au_Path(src_path), list(self._exts),
+                  self.recurse_var.get(), self.verify_var.get(), self.skip_var.get()),
+            daemon=True).start()
+
+    def _run(self, src, exts, recurse, verify, skip_existing):
+        t0 = time.time()
+        files = []
+        for ext in exts:
+            files.extend(src.rglob(f"*{ext}") if recurse else src.glob(f"*{ext}"))
+        files = sorted(set(files))
+        total = len(files)
+        if total == 0:
+            self.log.write("info", f"No matching files found under: {src}\n")
+            self._finish(); return
+
+        self.log.write("info",
+            f"Found {total} file(s) under: {src}\nExtensions: {', '.join(exts)}\n")
+        self.log.write("info", "─" * 64 + "\n")
+        ok = fail = skipped = 0
+
+        for i, fp in enumerate(files, 1):
+            if self._stop:
+                self.log.write("warn", f"[STOPPED at {i-1}/{total}]\n"); break
+            elapsed = time.time() - t0
+            rate = i / elapsed if elapsed > 0 else 0
+            eta  = (total - i) / rate if rate > 0 else 0
+            self._stat(
+                f"{i}/{total}  |  OK:{ok}  Fail:{fail}  Skip:{skipped}  |  "
+                f"{_au_timedelta(seconds=int(elapsed))} elapsed  "
+                f"ETA {_au_timedelta(seconds=int(eta))}")
+            self._prog(100 * i / total)
+
+            zip_path = fp.with_suffix(".zip")
+            if skip_existing and zip_path.exists():
+                self.log.write("skip", f"[SKIP]  {fp.name}  (zip already exists)\n")
+                skipped += 1; continue
+
+            try:
+                with _au_zipfile.ZipFile(zip_path, "w",
+                                          compression=_au_zipfile.ZIP_STORED,
+                                          allowZip64=True) as zf:
+                    zf.write(fp, fp.name)
+            except Exception as e:
+                self.log.write("fail", f"[FAIL]  {fp.name}: create: {e}\n")
+                zip_path.unlink(missing_ok=True); fail += 1; continue
+
+            if verify:
+                try:
+                    with _au_zipfile.ZipFile(zip_path, "r") as zf:
+                        bad = zf.testzip()
+                        if bad: raise ValueError(f"corrupt entry: {bad}")
+                        info = zf.getinfo(fp.name)
+                        if info.file_size != fp.stat().st_size:
+                            raise ValueError(
+                                f"size mismatch ({info.file_size} vs {fp.stat().st_size})")
+                except Exception as e:
+                    self.log.write("fail", f"[FAIL]  {fp.name}: verify: {e}\n")
+                    zip_path.unlink(missing_ok=True); fail += 1; continue
+
+            try:
+                fp.unlink()
+                sz = zip_path.stat().st_size
+                self.log.write("ok", f"[OK]    {fp.name}  ({sz:,} B)\n"); ok += 1
+            except Exception as e:
+                self.log.write("warn",
+                    f"[WARN]  {fp.name}: packed OK, delete failed: {e}\n"); ok += 1
+
+        elapsed = time.time() - t0
+        self.log.write("info", "─" * 64 + "\n")
+        self.log.write("info",
+            f"Done.  OK: {ok}  Fail: {fail}  Skip: {skipped}  |  "
+            f"{_au_timedelta(seconds=int(elapsed))}\n")
+        self._stat(f"Done — OK:{ok}  Fail:{fail}  Skip:{skipped}")
+        self._prog(100)
+        self._finish()
+
+    def _finish(self):
+        self.after(0, lambda: self.start_btn.configure(state="normal"))
+        self.after(0, lambda: self.stop_btn.configure(state="disabled"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  REMOVE READONLY WINDOW
+# ═══════════════════════════════════════════════════════════════════════════
+
+class RemoveReadOnlyWindow(tk.Toplevel):
+    """
+    Clears the read-only file attribute (os.chmod) AND removes the
+    Zone.Identifier NTFS alternate data stream (Windows 'Unblock File')
+    via PowerShell Unblock-File, which may require administrator elevation.
+    """
+
+    def __init__(self, root_win, app):
+        super().__init__(root_win)
+        self.app  = app
+        self._c   = app._c
+        self.title("Eggman's Datfile Creator Suite — Remove ReadOnly Attribute")
+        self.geometry("640x580+225+225")
+        self.minsize(520, 460)
+        self.configure(bg=self._c["options"])
+        self._log_lines: list = []
+        self._build_ui()
+        self.grab_set()
+
+    def _build_ui(self):
+        c   = self._c
+        PAD = 8
+
+        # ── Instructions ──────────────────────────────────────────────────────
+        inst_lf = ttk.LabelFrame(self, text="  Remove ReadOnly Attribute  ",
+                                  style="Paths.TLabelframe", padding=PAD)
+        inst_lf.pack(fill="x", padx=PAD, pady=(PAD, 0))
+        tk.Label(inst_lf,
+                 text="This tool performs two operations on all files and folders recursively:\n\n"
+                      "1.  Remove read-only file attribute — clears the Windows R flag on all "
+                      "files and folders using standard file permissions.\n\n"
+                      "2.  Unblock downloaded files — removes the Zone.Identifier NTFS alternate "
+                      "data stream (the 'This file came from another computer' security flag) "
+                      "using PowerShell's Unblock-File command.\n\n"
+                      "⚠  The Unblock-File step may require the application to be running as "
+                      "Administrator. If unblocking fails, re-run the Suite as Administrator "
+                      "(right-click → Run as administrator).",
+                 bg=c["paths"], fg=c["fg"], font=("Segoe UI", 9),
+                 wraplength=580, justify="left", anchor="nw").pack(fill="x")
+
+        # ── Source ────────────────────────────────────────────────────────────
+        src_lf = ttk.LabelFrame(self, text="  Target  ",
+                                  style="Options.TLabelframe", padding=PAD)
+        src_lf.pack(fill="x", padx=PAD, pady=(4, 0))
+
+        drop_label = tk.Label(src_lf,
+                              text="Drop a file or folder here — or use the Browse buttons",
+                              bg=c["entry"], fg="#5A5A5A",
+                              font=("Segoe UI", 9), pady=8, anchor="w", padx=8,
+                              relief="flat")
+        drop_label.pack(fill="x", pady=(0, 4))
+
+        self.var_path = tk.StringVar()
+        path_row = tk.Frame(src_lf, bg=c["options"])
+        path_row.pack(fill="x")
+        path_row.columnconfigure(0, weight=1)
+        self._path_ent = ttk.Entry(path_row, textvariable=self.var_path)
+        self._path_ent.grid(row=0, column=0, sticky="ew")
+        btn_row = tk.Frame(path_row, bg=c["options"])
+        btn_row.grid(row=0, column=1, padx=(4, 0))
+        ttk.Button(btn_row, text="Browse File",
+                   style="Browse.TButton",
+                   command=self._browse_file).pack(side="left", padx=(0, 4))
+        ttk.Button(btn_row, text="Browse Folder",
+                   style="Browse.TButton",
+                   command=self._browse_folder).pack(side="left")
+
+        # Wire DnD
+        try:
+            drop_label.drop_target_register(DND_FILES)
+            drop_label.dnd_bind("<<Drop>>", self._on_drop)
+            self._path_ent.drop_target_register(DND_FILES)
+            self._path_ent.dnd_bind("<<Drop>>", self._on_drop)
+        except Exception:
+            pass
+
+        # ── Log ───────────────────────────────────────────────────────────────
+        log_lf = ttk.LabelFrame(self, text="  Activity Log  ",
+                                  style="Progress.TLabelframe", padding=4)
+        log_lf.pack(fill="both", expand=True, padx=PAD, pady=(4, 4))
+        log_lf.columnconfigure(0, weight=1)
+        log_lf.rowconfigure(0, weight=1)
+
+        self._txt = tk.Text(log_lf, bg=c["list"], fg=c["fg"],
+                            font=("Consolas", 9), relief="flat", bd=0,
+                            state="disabled", wrap="word", height=8)
+        vsb = ttk.Scrollbar(log_lf, orient="vertical", command=self._txt.yview)
+        self._txt.configure(yscrollcommand=vsb.set)
+        self._txt.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        for tag, fg in [("ok",   "#1A6A2A"), ("warn", "#8A5A00"),
+                         ("err",  "#8A1A1A"), ("dim",  "#5A5A5A")]:
+            self._txt.tag_configure(tag, foreground=fg)
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        bot = ttk.Frame(self, style="Buttons.TFrame", padding=(PAD, 4))
+        bot.pack(fill="x", pady=(0, PAD))
+
+        self._run_btn = ttk.Button(bot, text="▶  Run",
+                                    style="Start.TButton",
+                                    command=self._on_run)
+        self._run_btn.pack(side="left")
+        ttk.Button(bot, text="Clear Log", style="Browse.TButton",
+                   command=self._clear_log).pack(side="left", padx=(8, 0))
+        ttk.Button(bot, text="💾  Save Log", style="Log.TButton",
+                   command=self._save_log).pack(side="left", padx=(8, 0))
+        ttk.Button(bot, text="Close", style="Browse.TButton",
+                   command=self.destroy).pack(side="right")
+
+    def _browse_file(self):
+        p = filedialog.askopenfilename(parent=self, title="Select a file")
+        if p: self.var_path.set(p)
+
+    def _browse_folder(self):
+        p = filedialog.askdirectory(parent=self, title="Select folder")
+        if p: self.var_path.set(p)
+
+    def _on_drop(self, event):
+        p = clean_dnd_path(event.data)
+        if p: self.var_path.set(p)
+        return event.action
+
+    def _write(self, text, tag=""):
+        self._txt.configure(state="normal")
+        if tag: self._txt.insert(tk.END, text, tag)
+        else:   self._txt.insert(tk.END, text)
+        self._txt.configure(state="disabled")
+        self._txt.yview_moveto(1.0)
+        self._log_lines.append(text)
+
+    def _clear_log(self):
+        self._txt.configure(state="normal")
+        self._txt.delete("1.0", tk.END)
+        self._txt.configure(state="disabled")
+        self._log_lines.clear()
+
+    def _save_log(self):
+        if not self._log_lines:
+            messagebox.showinfo("Log", "Nothing to save.", parent=self); return
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        p  = filedialog.asksaveasfilename(
+            parent=self, title="Save Log",
+            initialfile=f"remove_readonly_log_{ts}.txt",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if p:
+            _au_Path(p).write_text("".join(self._log_lines), encoding="utf-8")
+
+    def _on_run(self):
+        target = self.var_path.get().strip().strip('"')
+        if not target:
+            messagebox.showerror("Missing path",
+                                 "Please select a file or folder first.",
+                                 parent=self); return
+        if not os.path.exists(target):
+            messagebox.showerror("Not found",
+                                 f"Path does not exist:\n{target}",
+                                 parent=self); return
+        self._run_btn.configure(state="disabled")
+        threading.Thread(target=self._worker, args=(target,), daemon=True).start()
+
+    def _worker(self, target: str):
+        def post(text, tag=""): self.after(0, lambda t=text, g=tag: self._write(t, g))
+
+        post(f"Target: {target}\n", "dim")
+        post("─" * 60 + "\n", "dim")
+
+        # ── Step 1: os.chmod — clear read-only attribute ──────────────────────
+        post("Step 1: Clearing read-only attribute...\n")
+        chmod_ok = chmod_fail = 0
+        paths_to_chmod = []
+
+        if os.path.isfile(target):
+            paths_to_chmod = [target]
+        elif os.path.isdir(target):
+            post(f"  Scanning: {target}\n", "dim")
+            for root, dirs, files in os.walk(target):
+                for d in dirs:
+                    paths_to_chmod.append(os.path.join(root, d))
+                for f in files:
+                    paths_to_chmod.append(os.path.join(root, f))
+            paths_to_chmod.append(target)
+
+        for p in paths_to_chmod:
+            try:
+                os.chmod(p, _au_stat.S_IWRITE | _au_stat.S_IREAD)
+                chmod_ok += 1
+            except Exception as e:
+                post(f"  [WARN] chmod failed: {p}\n        {e}\n", "warn")
+                chmod_fail += 1
+
+        post(f"  Done — {chmod_ok} path(s) updated"
+             + (f", {chmod_fail} failed" if chmod_fail else "") + "\n", "ok")
+
+        # ── Step 2: PowerShell Unblock-File — remove Zone.Identifier ADS ─────
+        post("\nStep 2: Removing Zone.Identifier (Unblock-File)...\n")
+        post("  Note: This step may silently require Administrator privileges.\n", "dim")
+
+        if os.path.isfile(target):
+            ps_cmd = f"Unblock-File -LiteralPath '{target}'"
+        else:
+            ps_cmd = (f"Get-ChildItem -LiteralPath '{target}' "
+                      f"-Recurse -File | Unblock-File")
+
+        try:
+            result = _au_subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-Command", ps_cmd],
+                capture_output=True, text=True, timeout=300)
+            if result.returncode == 0:
+                post("  Unblock-File completed successfully.\n", "ok")
+            else:
+                post("  Unblock-File returned a non-zero exit code.\n", "warn")
+                if result.stderr.strip():
+                    post(f"  stderr: {result.stderr.strip()}\n", "warn")
+                post("  If files remain blocked, try re-running the Suite as "
+                     "Administrator.\n", "warn")
+        except Exception as e:
+            post(f"  [ERROR] PowerShell failed: {e}\n", "err")
+            post("  The chmod step completed, but Zone.Identifier removal "
+                 "was not performed.\n", "warn")
+
+        post("─" * 60 + "\n", "dim")
+        post("All operations complete.\n", "ok")
+        self.after(0, lambda: self._run_btn.configure(state="normal"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
