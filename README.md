@@ -686,7 +686,7 @@ The config is plain JSON and can be edited by hand if needed. Unrecognised keys 
 
 > **This section is for collectors and advanced users curious about the broader datfile ecosystem. None of this is required reading to use the tool.**
 
-To understand how the datfiles produced by this tool relate to the wider landscape, a structural analysis was performed across two large RomVault-managed collections using a companion script (`analyze_datfiles.py`, included with this project).
+To understand how the datfiles produced by this tool relate to the wider landscape, a structural analysis was performed across two large RomVault-managed collections using a companion script (`analyze_datfiles.py`, not included with this project).
 
 ### Collections Surveyed
 
