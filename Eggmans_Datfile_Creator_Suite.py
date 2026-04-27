@@ -3154,8 +3154,8 @@ class RunProgressWindow(tk.Toplevel):
         self.dats_written = 0
 
         self.title("Eggman\'s Datfile Creator Suite — Run Progress")
-        self.geometry("860x540+200+400")
-        self.minsize(640, 380)
+        self.geometry("860x580+200+400")
+        self.minsize(640, 420)
         self.configure(bg=self._c["progress"])
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -3248,6 +3248,19 @@ class RunProgressWindow(tk.Toplevel):
                    style="Log.TButton",
                    command=self.save_log).pack(side="left", padx=(8, 0))
 
+        # Stop buttons — mirror the main window controls from here
+        self.btn_rp_soft = ttk.Button(
+            bot, text="\u23f8  Soft Stop",
+            style="SoftStop.TButton",
+            command=self._soft_stop, state="disabled")
+        self.btn_rp_soft.pack(side="left", padx=(24, 0))
+
+        self.btn_rp_hard = ttk.Button(
+            bot, text="\u23f9  Hard Stop",
+            style="HardStop.TButton",
+            command=self._hard_stop, state="disabled")
+        self.btn_rp_hard.pack(side="left", padx=(8, 0))
+
         ttk.Button(bot, text="Close",
                    style="Browse.TButton",
                    command=self._on_close).pack(side="right")
@@ -3268,8 +3281,19 @@ class RunProgressWindow(tk.Toplevel):
         self.var_counts.set("Items: 0/0  |  Folders: 0  |  Dats written: 0")
         self.var_current.set("Current item: (none)")
         self.btn_preview.configure(state="disabled")
+        self.btn_rp_soft.configure(state="normal")
+        self.btn_rp_hard.configure(state="normal")
         self.deiconify()
         self.lift()
+
+    def _soft_stop(self):
+        self.app.soft_stop_cmd()
+        self.btn_rp_soft.configure(state="disabled")
+
+    def _hard_stop(self):
+        self.app.hard_stop_cmd()
+        self.btn_rp_hard.configure(state="disabled")
+        self.btn_rp_soft.configure(state="disabled")
 
     def set_status(self, text: str):
         self.var_status.set(text)
@@ -3347,6 +3371,8 @@ class RunProgressWindow(tk.Toplevel):
                 self._log_entry("No errors reported.")
             if self.app._preview_results:
                 self.btn_preview.configure(state="normal")
+            self.btn_rp_soft.configure(state="disabled")
+            self.btn_rp_hard.configure(state="disabled")
 
     def _spin_start(self):
         """Start the braille spinner animation during Phase 1."""
@@ -3718,9 +3744,16 @@ class AnalyzerWindow(tk.Toplevel):
                            bg=c["paths"], fg=FG, activebackground=c["paths"],
                            selectcolor=ENT).pack(side="left", padx=(0, 20))
 
-        self.btn_analyze = ttk.Button(top, text="Analyze", style="Start.TButton",
-                                     command=self._run)
-        self.btn_analyze.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        btn_row = ttk.Frame(top, style="Paths.TFrame")
+        btn_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        self.btn_analyze = ttk.Button(btn_row, text="Analyze", style="Start.TButton",
+                                      command=self._run)
+        self.btn_analyze.pack(side="left")
+        self.btn_analyze_stop = ttk.Button(btn_row, text="⏹  Stop",
+                                            style="HardStop.TButton",
+                                            command=self._cancel_analyze,
+                                            state="disabled")
+        self.btn_analyze_stop.pack(side="left", padx=(8, 0))
 
         # Findings text
         res = tk.Frame(self, bg=BG)
@@ -3788,6 +3821,11 @@ class AnalyzerWindow(tk.Toplevel):
         self.txt.delete("1.0", tk.END)
         self.txt.configure(state="disabled")
 
+    def _cancel_analyze(self):
+        if hasattr(self, "_cancel_flag"):
+            self._cancel_flag.set()
+        self.btn_analyze_stop.configure(state="disabled")
+
     def _run(self):
         p = self.var_path.get().strip()
         if not p or not os.path.isdir(p):
@@ -3800,6 +3838,7 @@ class AnalyzerWindow(tk.Toplevel):
         self._wt("Scanning folder structure — please wait...\n")
         self._wt("(Folder names will appear below as each is completed.)\n\n")
         self.btn_analyze.configure(state="disabled")
+        self.btn_analyze_stop.configure(state="normal")
         self._cancel_flag = threading.Event()
         self._scan_result = None
 
@@ -3830,6 +3869,7 @@ class AnalyzerWindow(tk.Toplevel):
         """Called on main thread when scan completes."""
         self._result = result
         self.btn_analyze.configure(state="normal")
+        self.btn_analyze_stop.configure(state="disabled")
         self._wt("\nScan complete.\n\n", "h")
         self._display(result)
 
@@ -3841,6 +3881,7 @@ class AnalyzerWindow(tk.Toplevel):
         self.var_rec.set("Analysis failed — see error above.")
         self.btn_apply.configure(state="disabled")
         self.btn_analyze.configure(state="normal")
+        self.btn_analyze_stop.configure(state="disabled")
 
     def _display(self, r):
         self._clear()
@@ -4533,12 +4574,13 @@ class BulkHeaderUpdaterWindow(tk.Toplevel):
         self.app   = app
         self._c    = app._c
         self.title("Eggman's Datfile Creator Suite — Bulk Header Updater")
-        self.geometry("780x740+150+150")
-        self.minsize(680, 580)
+        self.geometry("780x780+150+150")
+        self.minsize(680, 620)
         self.configure(bg="#EDE8E0")
 
         self._log_lines: list = []
         self._q = queue.Queue()
+        self._bhu_cancel = threading.Event()
 
         # Variables
         self.var_path  = tk.StringVar()
@@ -4676,9 +4718,15 @@ class BulkHeaderUpdaterWindow(tk.Toplevel):
                                     command=self._on_run)
         self._run_btn.pack(side="left")
 
+        self._stop_btn = ttk.Button(bot, text="⏹  Stop",
+                                     style="HardStop.TButton",
+                                     command=self._on_stop,
+                                     state="disabled")
+        self._stop_btn.pack(side="left", padx=(8, 0))
+
         ttk.Button(bot, text="Clear Log",
                    style="Browse.TButton",
-                   command=self._clear_log).pack(side="left", padx=(8, 0))
+                   command=self._clear_log).pack(side="left", padx=(16, 0))
 
         ttk.Button(bot, text="💾  Save Log",
                    style="Log.TButton",
@@ -4773,7 +4821,12 @@ class BulkHeaderUpdaterWindow(tk.Toplevel):
 
     # ── Run ───────────────────────────────────────────────────────────────────
 
+    def _on_stop(self):
+        self._bhu_cancel.set()
+        self._stop_btn.configure(state="disabled")
+
     def _on_run(self):
+        self._bhu_cancel.clear()
         new_date = self.var_date.get().strip()
         target   = self.var_path.get().strip().strip('"')
 
@@ -4799,6 +4852,7 @@ class BulkHeaderUpdaterWindow(tk.Toplevel):
         add_fp       = self.var_fp.get()
 
         self._run_btn.configure(state="disabled")
+        self._stop_btn.configure(state="normal")
         stamp = _datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._post(f"\n=== RUN {stamp} ===\n", "dim")
         self._post(f"Target : {root_path}\n", "dim")
@@ -4814,6 +4868,10 @@ class BulkHeaderUpdaterWindow(tk.Toplevel):
                 ok = err = warn = 0
 
                 for f in files:
+                    if self._bhu_cancel.is_set():
+                        self._post("\n[STOPPED by user]\n", "warn")
+                        self._log("[STOPPED by user]")
+                        break
                     try:
                         d = _bhu_update_file(f, new_date, field_values, add_fp)
                         warn += len(d["warnings"])
@@ -4850,6 +4908,7 @@ class BulkHeaderUpdaterWindow(tk.Toplevel):
 
             finally:
                 self.after(0, lambda: self._run_btn.configure(state="normal"))
+                self.after(0, lambda: self._stop_btn.configure(state="disabled"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -4914,12 +4973,13 @@ class GameRomCounterWindow(tk.Toplevel):
         self.app   = app
         self._c    = app._c
         self.title("Eggman's Datfile Creator Suite — Game & ROM Counter")
-        self.geometry("960x760+160+160")
-        self.minsize(720, 560)
+        self.geometry("960x800+160+160")
+        self.minsize(720, 600)
         self.configure(bg="#EDE8E0")
 
-        self._results: list = []   # list of dicts per dat
+        self._results: list = []
         self._scan_thread = None
+        self._grc_cancel  = threading.Event()
         self._view_mode   = "tree"  # "tree" | "flat"
         self._sort_col    = None    # last sorted column
         self._sort_asc    = True    # ascending?
@@ -4951,6 +5011,11 @@ class GameRomCounterWindow(tk.Toplevel):
                                      style="Start.TButton",
                                      command=self._on_scan)
         self._scan_btn.pack(side="left")
+        self._grc_stop_btn = ttk.Button(btn_f, text="⏹  Stop",
+                                         style="HardStop.TButton",
+                                         command=self._on_grc_stop,
+                                         state="disabled")
+        self._grc_stop_btn.pack(side="left", padx=(6, 0))
         ttk.Button(btn_f, text="Browse...",
                    style="Browse.TButton",
                    command=self._browse).pack(side="left", padx=(6, 0))
@@ -5100,6 +5165,10 @@ class GameRomCounterWindow(tk.Toplevel):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
+    def _on_grc_stop(self):
+        self._grc_cancel.set()
+        self._grc_stop_btn.configure(state="disabled")
+
     def _browse(self):
         p = filedialog.askdirectory(title="Select folder containing dat files",
                                     parent=self)
@@ -5118,7 +5187,9 @@ class GameRomCounterWindow(tk.Toplevel):
             messagebox.showerror("Invalid folder",
                                  "Please select a valid folder.", parent=self)
             return
+        self._grc_cancel.clear()
         self._scan_btn.configure(state="disabled")
+        self._grc_stop_btn.configure(state="normal")
         self.var_status.set("Scanning...")
         self._tree.delete(*self._tree.get_children())
         self._results.clear()
@@ -5176,6 +5247,7 @@ class GameRomCounterWindow(tk.Toplevel):
             f"{mode_hint} — {n} dat(s). "
             f"Ctrl+click / Shift+click to select for subtotals.")
         self._scan_btn.configure(state="normal")
+        self._grc_stop_btn.configure(state="disabled")
 
     def _populate_hier(self):
         """Build the hierarchical folder+dat tree."""
@@ -6302,10 +6374,11 @@ class RemoveReadOnlyWindow(tk.Toplevel):
         self.app  = app
         self._c   = app._c
         self.title("Eggman's Datfile Creator Suite — Remove ReadOnly Attribute")
-        self.geometry("640x580+225+225")
-        self.minsize(520, 460)
+        self.geometry("640x620+225+225")
+        self.minsize(520, 500)
         self.configure(bg=self._c["options"])
         self._log_lines: list = []
+        self._rro_cancel = threading.Event()
         self._build_ui()
         self.grab_set()
 
@@ -6392,8 +6465,13 @@ class RemoveReadOnlyWindow(tk.Toplevel):
                                     style="Start.TButton",
                                     command=self._on_run)
         self._run_btn.pack(side="left")
+        self._rro_stop = ttk.Button(bot, text="⏹  Stop",
+                                     style="HardStop.TButton",
+                                     command=self._on_rro_stop,
+                                     state="disabled")
+        self._rro_stop.pack(side="left", padx=(8, 0))
         ttk.Button(bot, text="Clear Log", style="Browse.TButton",
-                   command=self._clear_log).pack(side="left", padx=(8, 0))
+                   command=self._clear_log).pack(side="left", padx=(16, 0))
         ttk.Button(bot, text="💾  Save Log", style="Log.TButton",
                    command=self._save_log).pack(side="left", padx=(8, 0))
         ttk.Button(bot, text="Close", style="Browse.TButton",
@@ -6438,7 +6516,12 @@ class RemoveReadOnlyWindow(tk.Toplevel):
         if p:
             _au_Path(p).write_text("".join(self._log_lines), encoding="utf-8")
 
+    def _on_rro_stop(self):
+        self._rro_cancel.set()
+        self._rro_stop.configure(state="disabled")
+
     def _on_run(self):
+        self._rro_cancel.clear()
         target = self.var_path.get().strip().strip('"')
         if not target:
             messagebox.showerror("Missing path",
@@ -6449,6 +6532,7 @@ class RemoveReadOnlyWindow(tk.Toplevel):
                                  f"Path does not exist:\n{target}",
                                  parent=self); return
         self._run_btn.configure(state="disabled")
+        self._rro_stop.configure(state="normal")
         threading.Thread(target=self._worker, args=(target,), daemon=True).start()
 
     def _worker(self, target: str):
@@ -6485,6 +6569,11 @@ class RemoveReadOnlyWindow(tk.Toplevel):
              + (f", {chmod_fail} failed" if chmod_fail else "") + "\n", "ok")
 
         # ── Step 2: PowerShell Unblock-File — remove Zone.Identifier ADS ─────
+        if self._rro_cancel.is_set():
+            post("\n[STOPPED — Step 2 skipped]\n", "warn")
+            self.after(0, lambda: self._run_btn.configure(state="normal"))
+            self.after(0, lambda: self._rro_stop.configure(state="disabled"))
+            return
         post("\nStep 2: Removing Zone.Identifier (Unblock-File)...\n")
         post("  Note: This step may silently require Administrator privileges.\n", "dim")
 
@@ -6515,6 +6604,7 @@ class RemoveReadOnlyWindow(tk.Toplevel):
         post("─" * 60 + "\n", "dim")
         post("All operations complete.\n", "ok")
         self.after(0, lambda: self._run_btn.configure(state="normal"))
+        self.after(0, lambda: self._rro_stop.configure(state="disabled"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
