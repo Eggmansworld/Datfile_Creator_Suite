@@ -40,8 +40,9 @@ If this tool saves you time, consider supporting the work:
   - [Structure 4 — First Level Dirs as Games + Merge Dirs in Games](#structure-4--first-level-dirs-as-games--merge-dirs-in-games)
 - [Format: Modern vs Legacy](#format-modern-vs-legacy)
 - [Hash Options](#hash-options)
+- [Network Cap](#network-cap)
 - [Extension Filters](#extension-filters)
-- [7-Zip ZStandard Support](#7-zip-zstandard-support)
+- [ZStandard Support](#zstandard-support)
 - [Parent Name and Output Folder Structure](#parent-name-and-output-folder-structure)
 - [Dat Preview Window](#dat-preview-window)
 - [Run Progress Window](#run-progress-window)
@@ -64,26 +65,30 @@ If this tool saves you time, consider supporting the work:
 ## Requirements
 
 - **Python 3.10+**
-- **[7-Zip-ZStandard](https://github.com/mcmilk/7-Zip-zstd/releases)** — required for all zip analysis (Mixed and Zipped modes). Default install path: `C:\Program Files\7-Zip-Zstandard\7z.exe`
-- **tkinterdnd2** — for drag-and-drop support
+- **tkinterdnd2** — drag-and-drop support
+- **zstandard** — ZStandard decompression (hard required)
+- **zipfile-zstd** — drop-in zipfile with method-93 support (hard required)
+- **psutil** — NIC speed detection and live network monitoring (strongly recommended)
+- **[7-Zip-ZStandard](https://github.com/mcmilk/7-Zip-zstd/releases)** — required only by the **Recursive Archive Extractor** tool (ZIP/7Z/RAR extraction). No longer needed for dat hashing.
 
 ```
-pip install tkinterdnd2
+pip install tkinterdnd2 zstandard zipfile-zstd psutil
 ```
+
+The app will display an error dialog and refuse to start if `zstandard` or `zipfile-zstd` are not installed. `psutil` is optional — without it the network cap and live throughput display fall back gracefully.
 
 ---
 
 ## Python Installation
 
 1. Install Python 3.10 or later from [python.org](https://python.org)
-2. Install 7-Zip-ZStandard from the link above
-3. Install tkinterdnd2:
+2. Install required packages:
    ```
-   pip install tkinterdnd2
+   pip install tkinterdnd2 zstandard zipfile-zstd psutil
    ```
-4. Download `Eggmans_Datfile_Creator_Suite.py` and place it anywhere convenient
-5. Optionally place `Eggmans_Datfile_Creator_banner.png` in the same folder for the About window banner
-6. Run it:
+3. Download `Eggmans_Datfile_Creator_Suite.py` and place it anywhere convenient
+4. Optionally place `Eggmans_Datfile_Creator_banner.png` in the same folder for the About window banner
+5. Run it:
    ```
    python Eggmans_Datfile_Creator_Suite.py
    ```
@@ -95,7 +100,8 @@ The script saves its config file (`Eggmans_Datfile_Creator_Suite_config.json`) i
 1. Visit the Releases section of this repository
 2. Download the latest Windows exe
 3. Place it somewhere on your computer
-4. Run the exe.
+4. Run the exe
+
 ---
 
 ## Quick Start
@@ -109,7 +115,7 @@ The script saves its config file (`Eggmans_Datfile_Creator_Suite_config.json`) i
 7. Choose **Format**: Modern
 8. Click **Start**
 
-A detached **Run Progress** window opens automatically when the run begins, showing live status, progress, and activity log.
+A detached **Run Progress** window opens automatically when the run begins, showing live status, progress bar, network throughput, elapsed time, and activity log.
 
 Not sure which structure to use? Use **Tools → Analyze Folder Structure** before your first run.
 
@@ -124,7 +130,7 @@ Not sure which structure to use? Use **Tools → Analyze Folder Structure** befo
 | **Input top-level folder** | The folder whose immediate subfolders become individual dat jobs |
 | **Output folder (dat root)** | Root of the output structure. Datfiles are written into subfolders that mirror the input |
 | **Parent name (optional prefix)** | Prepended to every dat name: `Parent - TopLevel - Subfolder` |
-| **7-Zip-ZStandard (7z.exe)** | Full path to `7z.exe` from the 7-Zip-ZStandard release |
+| **7-Zip-ZStandard (7z.exe)** | Full path to `7z.exe` — used only by the Recursive Archive Extractor tool |
 
 All path fields support drag-and-drop.
 
@@ -212,7 +218,14 @@ Internally zipped subfolders are always preserved in the rom name:
      size="368640" crc="9c4a21d7" sha1="..."/>
 ```
 
-> **ZStandard note:** Archives compressed with RV-ZStandard (zip comment beginning `RVZSTD-`) or TorrentZip cannot be read by Python's built-in zipfile module. This tool uses 7-Zip-ZStandard exclusively for all zip analysis to ensure every compression method is handled correctly.
+Empty folders inside a zip produce a zero-byte rom entry with canonical empty hashes, matching RomVault's behaviour:
+
+```xml
+<rom name="path/to/emptydir/" size="0" crc="00000000"
+     sha1="da39a3ee5e6b4b0d3255bfef95601890afd80709"
+     sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+     md5="d41d8cd98f00b204e9800998ecf8427e"/>
+```
 
 ---
 
@@ -430,6 +443,18 @@ Attribute order in the output rom tag follows the RomVault DATReader source exac
 
 ---
 
+## Network Cap
+
+The hashing engine reads zip files from the network share at full available speed, which can saturate a 1 Gbps connection and impact other network users. A token-bucket rate limiter keeps throughput below a configurable ceiling.
+
+**Auto mode (default, `Net cap = 0`):** `psutil` detects the fastest active NIC and caps reads at 85% of its link speed, leaving 15% free for other traffic. The detected cap is logged at the start of every run.
+
+**Manual mode:** Enter a value in Mbit/s in the **Net cap Mbit/s** spinbox (in the Dat Settings row, to the right of the Threads spinbox). Setting `0` returns to auto mode.
+
+> `psutil` must be installed for auto mode to work. Without it the cap is unlimited and the spinbox still accepts a manual value.
+
+---
+
 ## Extension Filters
 
 Available in **Mixed mode only** — in Zipped mode the unit is always the complete `.zip` file.
@@ -450,15 +475,23 @@ Filtering is applied during the folder scan phase, before any hashing begins. Ex
 
 ---
 
-## 7-Zip ZStandard Support
+## ZStandard Support
 
-All zip analysis in this tool — for both Mixed and Zipped modes — is performed exclusively through **7-Zip-ZStandard**. Python's built-in `zipfile` module cannot handle ZStandard-compressed archives (compression method 93), which is the format produced by RomVault's own RV-ZStandard recompressor and by TorrentZip equivalents.
+Zip archives compressed with **RV-ZStandard** (zip comment beginning `RVZSTD-`) are handled natively by the `zipfile-zstd` and `zstandard` packages. No external tools are required for reading zip contents.
 
 **Detection:** An RV-ZStandard archive can be identified by its zip comment, which begins with `RVZSTD-` followed by a CRC32 checksum (e.g. `RVZSTD-22DA5DD0`). TorrentZip archives use a similar deterministic recompression approach that also sets standardised internal timestamps (`1980/00/00 00-00-00`).
 
-**Path configuration:** Set the full path to `7z.exe` in the **7-Zip-ZStandard** field. The default `C:\Program Files\7-Zip-Zstandard\7z.exe` is used if the field is left blank. The field supports drag-and-drop.
+**Supported compression methods:**
 
-**File date and timestamps (Zipped mode):** When **File date & time** is enabled, the timestamp for each rom entry is read from the zip's internal metadata and written as `date="yyyy/mm/dd hh-mm-ss"`. For TorrentZip and RV-ZStandard archives this will always be `1980/00/00 00-00-00`, which is the standardised DOS epoch timestamp these tools write. This is intentional — it documents that the archive has been deterministically recompressed, and preserves the timestamp value for any future rom manager that implements timestamp restoration.
+| Method | Description | How handled |
+|---|---|---|
+| 0 | Stored (no compression) | Direct read |
+| 8 | Deflate (standard zip) | `zlib.decompressobj(-15)` |
+| 93 | ZStandard / RVZSTD | `zstandard.ZstdDecompressor` |
+
+**File date and timestamps (Zipped mode):** When **File date & time** is enabled, the timestamp for each rom entry is read from the zip's internal metadata and written as `date="yyyy/mm/dd hh-mm-ss"`. For TorrentZip and RV-ZStandard archives this will always be `1980/00/00 00-00-00` — the standardised DOS epoch timestamp these tools write. This is intentional — it documents that the archive has been deterministically recompressed.
+
+**7-Zip-ZStandard** (`7z.exe`) is still required if you use the **Recursive Archive Extractor** tool for ZIP/7Z/RAR extraction. It is no longer used for dat hashing.
 
 ---
 
@@ -521,10 +554,32 @@ When **Start** is pressed, a detached **Run Progress** window opens automaticall
 **Features:**
 - Live status line, item counts, and progress bar
 - Animated braille spinner during Phase 1 (folder discovery), switching to a determinate progress bar during Phase 2 (hashing)
-- Scrollable activity log — each folder is logged in real time as it is discovered during Phase 1, with colour-coded entries (amber for scan events, blue for folder processing, green for completed dats)
+- **Network throughput display** — live receive/send speed updated once per second:
+  ```
+  Network:  ↓  423.1 Mbit/s   ↑    1.5 Mbit/s
+  ```
+  Requires `psutil`. Shows `(psutil not installed)` if absent.
+- **Elapsed time display** — running clock updated once per second:
+  ```
+  Elapsed:  7m 42s
+  ```
+  Freezes with `(finished)` appended when the run completes.
+- Scrollable activity log — each folder and zip is logged in real time as it is processed, with colour-coded entries:
+  - **Amber** — phase and scan events
+  - **Blue** — folder boundaries (`>>`) and subdirectory markers (`[dir]`)
+  - **Brown** — subfolder entries within a job folder
+  - **Green** — successfully hashed zips with timing and throughput
+  - **Grey** — carried items (incremental mode)
+  - **Red** — errors
+  - **Bright green** — completed dat files
+- Per-zip diagnostics in the log, e.g.:
+  ```
+  ✓ GameName.zip  (648.4 MB in 6.2s = 104.6 MB/s (1333 entries, stream))
+  ```
+  `mem` = loaded to RAM (BytesIO path); `stream` = sequential read from network. Entries flagged `[SLOW]` if throughput falls below 5 MB/s. Individual slow entries within a zip are identified by name and uncompressed size.
 - **📋 Show Progress** button in the main window re-opens the progress window if it has been closed — the activity log is preserved until the next run starts
 - **🔍 Preview Dats** button enables in the progress window once a run completes
-- **💾 Save Activity Log** — saves the full log to a text file
+- **💾 Save Activity Log** — saves the full log to a text file. Search for `[ERROR]` to find any problem archives, or `[SUMMARY]` to jump to the final error count.
 - The window cannot be closed while a run is in progress — use Soft Stop or Hard Stop first
 
 The progress window opens at a fixed position on screen and can be freely moved and resized.
@@ -814,7 +869,8 @@ This distinction matters for RomVault's Fix engine: only `<game>` entries can be
 - **The `forcepacking="unzip"` and `forcepacking="zip"` values are not generated.** Only `fileonly` (Mixed) and absent (Zipped) are produced.
 - **`<softwarelist>` and MAME XML formats are not produced.** These are specialised formats for MAME's internal database and are outside the scope of this tool.
 - **Incremental update Mixed mode cannot detect same-name same-size file replacements.** If a file has been replaced with content of identical filename and size, the change will not be detected. The Pre-flight Check dialog warns of this when Mixed mode is active. A full rehash option is available in the dialog for this scenario.
-- **Per All mode with very large collections may be slow during Phase 1.** The scanner must traverse every folder at every depth. The progress window shows a live spinner and logs each folder as it is discovered, so you can see that the scan is still running. Mixed mode with SHA-256 enabled on large uncompressed files will be the primary Phase 2 bottleneck.
+- **Per All mode with very large collections may be slow during Phase 1.** The scanner must traverse every folder at every depth. The progress window shows a live spinner and logs each folder as it is discovered, so you can see that the scan is still running.
+- **Heavily compressed Unity game archives (.resS resource streaming files)** with extreme compression ratios (e.g. 10 GB uncompressed in a 514 MB zip) will be slower than other archives regardless of network speed. The bottleneck is CPU decompression time, not network throughput. These entries are identified by name in the activity log.
 
 ---
 

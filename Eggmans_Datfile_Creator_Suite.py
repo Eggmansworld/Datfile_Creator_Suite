@@ -32,9 +32,10 @@ RomVault DAT format (from RVWorld DATReader source):
   - forcepacking absent on Zipped header → RomVault defaults to Zip mode
 """
 
-import os, sys, json, re, time, queue, zlib, stat
+import os, sys, json, re, time, queue, zlib, stat, io, gc
 import ctypes, hashlib, threading, datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (ThreadPoolExecutor, as_completed,
+                                wait as _cf_wait, FIRST_COMPLETED)
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -43,10 +44,57 @@ from tkinter import ttk, filedialog, messagebox
 from tkinterdnd2 import DND_FILES, TkinterDnD
 from xml.sax.saxutils import escape as xml_escape
 
+# ─── Hard-required pip packages ────────────────────────────────────────────
+# Install with:  pip install zstandard zipfile-zstd
+# Both are needed for streaming ZStandard (RVZSTD, method-93) zip entries.
+try:
+    import zipfile_zstd as _zipfile_mod   # drop-in zipfile + method-93 support
+    import zstandard as _zstandard        # noqa: F401 — validates install
+    import zstandard as _zstd_lib         # used directly for stream-path RVZSTD decompression
+    _DEPS_OK    = True
+    _DEPS_ERROR = ""
+except ImportError as _dep_err:
+    import zipfile as _zipfile_mod        # bare fallback so name is always defined
+    _DEPS_OK    = False
+    _DEPS_ERROR = str(_dep_err)
+
+# ─── Optional: psutil for NIC speed auto-detection ─────────────────────────
+# Install with:  pip install psutil
+# If absent, auto network cap falls back to unlimited (user can set manually).
+try:
+    import psutil as _psutil
+    _PSUTIL_OK = True
+except ImportError:
+    _psutil    = None   # type: ignore
+    _PSUTIL_OK = False
+
 CONFIG_FILENAME       = "Eggmans_Datfile_Creator_Suite_config.json"
 FILE_ATTRIBUTE_HIDDEN = 0x2
 FILE_ATTRIBUTE_SYSTEM = 0x4
 MAX_SAFE_PATH         = 240
+
+# ── SMB/network concurrency control ─────────────────────────────────────────
+# BYTESIO_THRESHOLD: zips at or below this size are read entirely into a
+#   BytesIO buffer in one sequential pass.  All ZipFile seeks then happen in
+#   RAM — no further network traffic, no BufferedReader seek-invalidation.
+#   Set to 500 MB.  At 4 workers peak RAM from BytesIO = 2 GB, acceptable
+#   on modern hardware.  This covers virtually all multi-entry "medium" zips
+#   that would otherwise stall due to per-entry seek overhead (see below).
+#
+# _LARGE_ZIP_LOCK: Semaphore(1) — only one zip >500 MB reads from the network
+#   at a time.  Prevents SMB credit exhaustion from concurrent large streams.
+#
+# STREAM_OPEN_BUF: Buffer size for the stream (large-zip) path.  Must be
+#   SMALL (4 MB, not 32 MB).  Python's BufferedReader.seek() unconditionally
+#   clears its buffer on every call.  ZipFile.open(entry) always seeks to
+#   the entry's header_offset.  With a 32 MB buffer, each of N entries
+#   discards + re-reads 32 MB → N × 320 ms stall at 100 MB/s.  With 4 MB,
+#   each seek-miss costs only ~40 ms and re-reads cover ~9 consecutive entries
+#   before the next miss.
+BYTESIO_THRESHOLD = 500 * 1024 * 1024   # 500 MB
+STREAM_OPEN_BUF   =   4 * 1024 * 1024  # 4 MB  (stream path only)
+STREAM_ENTRY_MEM  =  64 * 1024 * 1024  # 64 MB max compressed bytes held in RAM per entry
+_LARGE_ZIP_LOCK   = threading.Semaphore(1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -180,6 +228,7 @@ class Settings:
     ext_exclude:    str  = ""         # e.g. ".nfo, .sfv, thumbs.db, .ds_store"
     multithread:    bool = True
     threads:        int  = 4
+    net_cap_mbps:   int  = 0     # 0 = auto (85% of NIC speed); >0 = manual Mbit/s cap
 
     def to_dict(self) -> dict:
         d = {k: v for k, v in self.__dict__.items()}
@@ -252,15 +301,87 @@ def write_dat_header(f, dat_name: str, s: "Settings", header_date: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  NETWORK BANDWIDTH THROTTLE
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _BandwidthThrottle:
+    """
+    Thread-safe token-bucket rate limiter for I/O reads.
+
+    All worker threads share one instance.  Each call to consume(n) deducts
+    n bytes from the token bucket; if the bucket is empty the call sleeps
+    until enough tokens have refilled, effectively capping read throughput.
+
+    rate_bytes_per_sec <= 0 means unlimited (consume() is a no-op).
+    """
+    def __init__(self, rate_bytes_per_sec: float):
+        self._rate   = float(rate_bytes_per_sec)
+        self._tokens = self._rate          # start full
+        self._last   = time.monotonic()
+        self._lock   = threading.Lock()
+
+    def consume(self, nbytes: int,
+                cancel: Optional[threading.Event] = None) -> None:
+        if self._rate <= 0:
+            return
+        sleep_time = 0.0
+        with self._lock:
+            now     = time.monotonic()
+            elapsed = now - self._last
+            self._last = now
+            # Refill — cap at one second's worth to prevent burst after idle
+            self._tokens = min(self._rate,
+                               self._tokens + elapsed * self._rate)
+            if self._tokens >= nbytes:
+                self._tokens -= nbytes
+            else:
+                deficit      = nbytes - self._tokens
+                self._tokens = 0
+                sleep_time   = deficit / self._rate
+        # Sleep outside the lock in 50ms increments so cancel can interrupt
+        if sleep_time > 0:
+            deadline = time.monotonic() + sleep_time
+            while time.monotonic() < deadline:
+                if cancel and cancel.is_set():
+                    return
+                remaining = deadline - time.monotonic()
+                time.sleep(min(0.05, remaining))
+
+
+def _detect_net_cap_bytes_per_sec(pct: float = 0.85) -> float:
+    """
+    Return pct% of the fastest active NIC's speed in bytes/sec, or 0.0 if
+    psutil is not installed / no speed can be determined.
+
+    pct=0.85 leaves ~15% of NIC capacity free for other processes.
+    """
+    if not _PSUTIL_OK or _psutil is None:
+        return 0.0
+    try:
+        max_mbps = 0
+        for _nic, st in _psutil.net_if_stats().items():
+            if st.isup and st.speed > 0:
+                max_mbps = max(max_mbps, st.speed)
+        if max_mbps > 0:
+            return (max_mbps * 1_000_000 / 8) * pct
+    except Exception:
+        pass
+    return 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  HASHING — MIXED (file as-is)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def hash_file(path: str, include_md5: bool,
               include_sha256: bool,
-              cancel: threading.Event, chunk: int = 8*1024*1024):
+              cancel: threading.Event,
+              chunk: int = 8*1024*1024,
+              throttle: Optional["_BandwidthThrottle"] = None):
     """
-    Hash a file with CRC32 + SHA1 (always) plus optional MD5 / SHA-256 / SHA-512.
+    Hash a file with CRC32 + SHA1 (always) plus optional MD5 / SHA-256.
     Returns (size, crc, sha1, md5, sha256) — optional fields may be None.
+    throttle: shared _BandwidthThrottle instance, or None for unlimited.
     """
     size = 0; crc = 0
     sha1   = hashlib.sha1()
@@ -273,6 +394,8 @@ def hash_file(path: str, include_md5: bool,
             buf = f.read(chunk)
             if not buf:
                 break
+            if throttle:
+                throttle.consume(len(buf), cancel=cancel)
             size += len(buf)
             crc   = zlib.crc32(buf, crc)
             sha1.update(buf)
@@ -288,136 +411,454 @@ def hash_file(path: str, include_md5: bool,
 #  HASHING — ZIPPED (analyze zip contents)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _get_entry_data_offset(raw_fh, entry) -> int:
+    """
+    Return the byte offset in raw_fh where this entry's compressed data begins.
+
+    Python 3.11 added ZipInfo.start_offset; for 3.10 we read the local header.
+    The local header's extra field length CAN differ from the central directory
+    extra length, so we always read the local header to get the right offset.
+    Falls back to central-dir calculation if the read fails.
+    """
+    # Python 3.11+
+    try:
+        so = entry.start_offset
+        if so is not None:
+            return so
+    except AttributeError:
+        pass
+    # Read local header at header_offset + 26 to get fname_len and extra_len
+    try:
+        raw_fh.seek(entry.header_offset + 26)
+        lens = raw_fh.read(4)
+        if len(lens) == 4:
+            fname_len = int.from_bytes(lens[0:2], 'little')
+            extra_len = int.from_bytes(lens[2:4], 'little')
+            return entry.header_offset + 30 + fname_len + extra_len
+    except Exception:
+        pass
+    # Fallback using central directory values (usually correct)
+    return entry.header_offset + 30 + len(entry.filename.encode('utf-8')) + len(entry.extra)
+
+
+def _direct_hash_entry(raw_fh, entry, sha1_obj, md5_obj, sha256_obj, cancel, chunk_size):
+    """
+    Hash a zip entry by reading its compressed bytes in ONE large sequential
+    read, then decompressing from memory.
+
+    This replaces zf.open(entry) for the stream path.  The critical problem
+    with zf.open() over SMB is that Python's ZipExtFile._read2() uses
+    MIN_READ_SIZE=4096 bytes per read call.  For a 3MB entry that means
+    ~750 sequential 4096-byte reads, each of which can cause SMB credit stalls
+    in between.  One raw_fh.read(compress_size) = one large SMB request per
+    entry — exactly what RomVault's ZipFileOpenReadStream does.
+
+    Supports method 0 (Stored), method 8 (Deflate), method 93 (RVZSTD).
+    Falls back to zf.open() for anything else (handled by caller).
+
+    Returns True on success, False if method is unsupported (caller should
+    fall back to zf.open()).
+    """
+    if entry.compress_type not in (0, 8, 93):
+        return False   # caller falls back to zf.open()
+    if entry.file_size == 0:
+        return True    # nothing to hash; zero-byte empty hash already applied
+
+    data_offset = _get_entry_data_offset(raw_fh, entry)
+
+    if entry.compress_size > STREAM_ENTRY_MEM:
+        # Entry is too large to hold in RAM — use streaming reads in chunks.
+        # Still use direct raw_fh reads (large chunks, not 4096-byte reads).
+        raw_fh.seek(data_offset)
+        remaining = entry.compress_size
+        if cancel.is_set():
+            raise RuntimeError("CANCELLED")
+
+        if entry.compress_type == 0:
+            while remaining > 0:
+                if cancel.is_set(): raise RuntimeError("CANCELLED")
+                buf = raw_fh.read(min(chunk_size, remaining))
+                if not buf: break
+                remaining -= len(buf)
+                sha1_obj.update(buf)
+                if md5_obj:    md5_obj.update(buf)
+                if sha256_obj: sha256_obj.update(buf)
+
+        elif entry.compress_type == 8:
+            dec = zlib.decompressobj(-15)
+            while remaining > 0:
+                if cancel.is_set(): raise RuntimeError("CANCELLED")
+                chunk = raw_fh.read(min(chunk_size, remaining))
+                if not chunk: break
+                remaining -= len(chunk)
+                out = dec.decompress(chunk)
+                if out:
+                    sha1_obj.update(out)
+                    if md5_obj:    md5_obj.update(out)
+                    if sha256_obj: sha256_obj.update(out)
+            try:
+                out = dec.flush()
+                if out:
+                    sha1_obj.update(out)
+                    if md5_obj:    md5_obj.update(out)
+                    if sha256_obj: sha256_obj.update(out)
+            except Exception:
+                pass
+
+        elif entry.compress_type == 93:
+            dctx = _zstd_lib.ZstdDecompressor()
+            # Wrap the raw limited region in a reader
+            lim = _LimitedReader(raw_fh, entry.compress_size)
+            with dctx.stream_reader(lim, read_size=chunk_size) as reader:
+                while True:
+                    if cancel.is_set(): raise RuntimeError("CANCELLED")
+                    out = reader.read(chunk_size)
+                    if not out: break
+                    sha1_obj.update(out)
+                    if md5_obj:    md5_obj.update(out)
+                    if sha256_obj: sha256_obj.update(out)
+        return True
+
+    # ── Normal path: ONE large read of entire compressed entry ───────────────
+    raw_fh.seek(data_offset)
+    if cancel.is_set():
+        raise RuntimeError("CANCELLED")
+    compressed = raw_fh.read(entry.compress_size)   # ← the key: ONE SMB request
+
+    if entry.compress_type == 0:
+        sha1_obj.update(compressed)
+        if md5_obj:    md5_obj.update(compressed)
+        if sha256_obj: sha256_obj.update(compressed)
+
+    elif entry.compress_type == 8:
+        dec = zlib.decompressobj(-15)
+        for i in range(0, len(compressed), chunk_size):
+            if cancel.is_set(): raise RuntimeError("CANCELLED")
+            out = dec.decompress(compressed[i:i + chunk_size])
+            if out:
+                sha1_obj.update(out)
+                if md5_obj:    md5_obj.update(out)
+                if sha256_obj: sha256_obj.update(out)
+        try:
+            out = dec.flush()
+            if out:
+                sha1_obj.update(out)
+                if md5_obj:    md5_obj.update(out)
+                if sha256_obj: sha256_obj.update(out)
+        except Exception:
+            pass
+
+    elif entry.compress_type == 93:
+        dctx = _zstd_lib.ZstdDecompressor()
+        with dctx.stream_reader(io.BytesIO(compressed), read_size=chunk_size) as reader:
+            while True:
+                if cancel.is_set(): raise RuntimeError("CANCELLED")
+                out = reader.read(chunk_size)
+                if not out: break
+                sha1_obj.update(out)
+                if md5_obj:    md5_obj.update(out)
+                if sha256_obj: sha256_obj.update(out)
+
+    del compressed   # free immediately
+    return True
+
+
+class _LimitedReader:
+    """
+    Wraps a file-like object and limits reads to at most `limit` bytes.
+    Used to feed a ZstdDecompressor exactly one entry's compressed data
+    without it reading past the entry boundary.
+    """
+    __slots__ = ('_fh', '_remaining')
+    def __init__(self, fh, limit):
+        self._fh        = fh
+        self._remaining = limit
+    def read(self, n=-1):
+        if self._remaining <= 0:
+            return b''
+        if n < 0 or n > self._remaining:
+            n = self._remaining
+        data = self._fh.read(n)
+        self._remaining -= len(data)
+        return data
+    def readinto(self, b):
+        data = self.read(len(b))
+        n = len(data)
+        b[:n] = data
+        return n
+
+
+def _pipeline_hash(fh, sha1_obj, md5_obj, sha256_obj, cancel, chunk_size):
+    """
+    Double-buffer pipeline matching RomVault's ThreadReadBuffer pattern.
+
+    Reader thread decompresses the NEXT chunk while main thread hashes
+    the CURRENT chunk.  Both zlib/zstd and hashlib are C extensions that
+    release the GIL, so they run in true parallel on separate CPU cores.
+
+    Used for ALL paths (BytesIO and stream) for entries large enough to
+    make the thread overhead worthwhile.
+
+    buf_q.get() uses a 30-second timeout so a stalled network read never
+    blocks Hard Stop indefinitely.
+    """
+    buf_q = queue.Queue(maxsize=2)
+
+    def _reader():
+        try:
+            while not cancel.is_set():
+                data = fh.read(chunk_size)
+                buf_q.put(data)   # blocks if queue full — that's fine
+                if not data:
+                    return
+        except Exception as exc:
+            buf_q.put(exc)        # put (not put_nowait) so it's never lost
+
+    reader_thread = threading.Thread(target=_reader, daemon=True)
+    reader_thread.start()
+    try:
+        while True:
+            try:
+                item = buf_q.get(timeout=30)
+            except queue.Empty:
+                # Reader stalled for 30 s — check cancel and retry
+                if cancel.is_set():
+                    raise RuntimeError("CANCELLED")
+                continue   # keep waiting; could be heavy decompression
+            if isinstance(item, Exception):
+                raise item
+            if not item:
+                break
+            if cancel.is_set():
+                raise RuntimeError("CANCELLED")
+            sha1_obj.update(item)
+            if md5_obj:    md5_obj.update(item)
+            if sha256_obj: sha256_obj.update(item)
+    finally:
+        reader_thread.join(timeout=5)   # short — it's daemon, will die with process
+
+
 def analyze_zip(zip_path: str, include_md5: bool,
                 include_sha256: bool,
                 incl_date: bool,
                 cancel: threading.Event,
-                sevenzip_path: str = "") -> List[tuple]:
+                sevenzip_path: str = "",
+                throttle: Optional["_BandwidthThrottle"] = None) -> Tuple[List[tuple], str]:
     """
-    Analyze a zip archive using 7-Zip-ZStandard exclusively.
+    Analyze a zip archive using Python's zipfile module with zipfile_zstd.
+    Returns (results_list, diag_string).
 
-    Handles all compression methods including ZStandard (method 93 / RVZSTD),
-    TorrentZip, standard Deflate, Stored, etc.
+    Two execution paths chosen by zip file size vs BYTESIO_THRESHOLD:
 
-    Strategy:
-      1. `7z l -slt -ba <zip>` — parse technical listing for name/size/crc/date
-      2. `7z e -so <zip> <entry>` — pipe each file's decompressed bytes for SHA1/MD5
+    SMALL PATH (zip <= BYTESIO_THRESHOLD, default 64 MB):
+      - Reads the entire zip file into a BytesIO buffer in one sequential pass.
+      - All ZipFile seeks then happen in RAM — no further network traffic.
+      - Safe for parallel execution: multiple threads can each do this without
+        competing for the same SMB stream.
+      - Throttle post-consumed (after the read) so the read runs at full speed.
 
-    CRC from the 7z listing is the CRC of the uncompressed data, which matches
-    what RomVault expects in the dat (same as ZipInfo.CRC from Python zipfile).
+    LARGE PATH (zip > BYTESIO_THRESHOLD):
+      - Acquires _LARGE_ZIP_LOCK (Semaphore(1)) so only one large zip is read
+        from the network at a time.  This is the root fix for the SMB credit
+        exhaustion that caused throughput collapse at ~50 zips.
+      - Reads with a 32 MB OS-level buffer and entries sorted by header_offset
+        so all reads are sequential forward seeks (SMB prefetch-friendly).
+      - Throttle consumed per-entry in compressed bytes (actual network traffic).
+      - Lock released as soon as the file is closed, before result sorting.
     """
-    import subprocess
+    CHUNK       = 4 * 1024 * 1024   # 4 MB — matches RomVault's Buffersize constant
+    SLOW_THRESH = 5.0               # MB/s below which a [SLOW] tag is prepended
 
-    exe = sevenzip_path.strip() if sevenzip_path.strip() else \
-          r"C:\Program Files\7-Zip-Zstandard\7z.exe"
-
-    if not os.path.isfile(exe):
-        raise RuntimeError(
-            f"7-Zip-ZStandard not found at:\n  {exe}\n"
-            f"Set the correct path in the '7-Zip-ZStandard (7z.exe)' field.")
-
-    # ── Step 1: list contents ────────────────────────────────────────────────
-    try:
-        result = subprocess.run(
-            [exe, "l", "-slt", "-ba", zip_path],
-            capture_output=True, timeout=120)
-    except FileNotFoundError:
-        raise RuntimeError(
-            f"7-Zip-ZStandard not found at:\n  {exe}\n"
-            f"Set the correct path in the '7-Zip-ZStandard (7z.exe)' field.")
-
-    if result.returncode not in (0, 1):
-        raise RuntimeError(
-            f"7z list failed (rc={result.returncode}): "
-            f"{result.stderr.decode(errors='replace').strip()}")
-
-    listing = result.stdout.decode("utf-8", errors="replace")
-
-    # Parse key=value blocks separated by blank lines
-    entries: List[dict] = []
-    current: dict = {}
-    for line in listing.splitlines():
-        line = line.strip()
-        if not line:
-            if current:
-                entries.append(current)
-                current = {}
-            continue
-        if "=" in line:
-            k, _, v = line.partition("=")
-            current[k.strip().lower()] = v.strip()
-    if current:
-        entries.append(current)
-
-    # Keep only file entries (skip directories — attributes start with 'D')
-    file_entries = [
-        e for e in entries
-        if e.get("path") and
-           not e.get("attributes", "").upper().startswith("D")
-    ]
-    file_entries.sort(key=lambda e: e.get("path", "").lower())
-
-    # ── Step 2: hash each file via decompressed stdout stream ────────────────
+    t_start = time.monotonic()
     results = []
-    for entry in file_entries:
-        if cancel.is_set():
-            raise RuntimeError("CANCELLED")
+    try:
+        zip_size = os.path.getsize(zip_path)
+    except OSError:
+        zip_size = 0
 
-        rom_name  = entry.get("path", "").replace("\\", "/")
+    use_bytesio   = (0 < zip_size <= BYTESIO_THRESHOLD)
+    lock_acquired = False
 
-        try:
-            file_size = int(entry.get("size", "0"))
-        except ValueError:
-            file_size = 0
+    # Canonical hashes for zero-byte content (empty file or empty folder entry).
+    _EMPTY_SHA1   = "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+    _EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    _EMPTY_MD5    = "d41d8cd98f00b204e9800998ecf8427e"
 
-        crc_raw   = entry.get("crc", "")
-        crc32_hex = crc_raw.lower().zfill(8) if crc_raw else "00000000"
+    # ── Pipeline threshold ───────────────────────────────────────────────────
+    # Entries with uncompressed size >= this use the decompression/hash pipeline.
+    # Entries below this use a simple loop (thread overhead > benefit).
+    PIPELINE_THRESH = CHUNK   # 4 MB — one full read chunk
 
-        # Date: 7z reports as "YYYY-MM-DD HH:MM:SS" → reformat to dat convention
-        date_str = None
-        if incl_date:
-            raw = entry.get("modified", entry.get("created", ""))
-            if raw and len(raw) >= 19:
+    # ── Per-entry slow threshold ─────────────────────────────────────────────
+    # Entries taking longer than this are logged individually in the diag string
+    # so you can identify which specific entries are bottlenecks.
+    ENTRY_SLOW_S = 3.0   # seconds
+
+    slow_entries = []   # [(name, seconds, MB_uncompressed)]
+
+    def _hash_entries(zf, raw_fh_=None):
+        """
+        Hash all entries.
+        raw_fh_: provided for stream path only — enables _direct_hash_entry
+        which reads each entry's compressed bytes as ONE large raw read (one
+        SMB request per entry), eliminating the 4096-byte-read stalls that
+        zipfile.ZipExtFile._read2() causes internally.
+        When raw_fh_ is None (BytesIO path), uses zf.open() with pipeline.
+        """
+        all_entries = zf.infolist()
+        if not all_entries:
+            return
+
+        dir_entries  = [e for e in all_entries if     e.is_dir()]
+        file_entries = [e for e in all_entries if not e.is_dir()]
+        read_order   = sorted(file_entries, key=lambda e: e.header_offset)
+
+        for entry in dir_entries:
+            if cancel.is_set():
+                raise RuntimeError("CANCELLED")
+            rom_name = entry.filename.replace("\\", "/")
+            if not rom_name.endswith("/"):
+                rom_name += "/"
+            results.append((
+                rom_name, 0, "00000000", _EMPTY_SHA1,
+                _EMPTY_MD5    if include_md5    else None,
+                _EMPTY_SHA256 if include_sha256 else None,
+                None,
+            ))
+
+        for entry in read_order:
+            if cancel.is_set():
+                raise RuntimeError("CANCELLED")
+
+            sha1_obj   = hashlib.sha1()
+            md5_obj    = hashlib.md5()    if include_md5    else None
+            sha256_obj = hashlib.sha256() if include_sha256 else None
+
+            t_entry = time.monotonic()
+
+            if raw_fh_ is not None:
+                # STREAM PATH: one large raw read per entry via _direct_hash_entry.
+                ok = _direct_hash_entry(raw_fh_, entry, sha1_obj, md5_obj,
+                                        sha256_obj, cancel, CHUNK)
+                if not ok:
+                    # Unknown compression method — fall back to zf.open()
+                    with zf.open(entry) as fh:
+                        _pipeline_hash(fh, sha1_obj, md5_obj, sha256_obj,
+                                       cancel, CHUNK)
+                # Post-consume throttle after the read
+                if throttle and entry.compress_size > 0:
+                    throttle.consume(entry.compress_size, cancel=cancel)
+            else:
+                # BYTESIO PATH: all seeks in RAM, use pipeline for large entries
+                with zf.open(entry) as fh:
+                    if entry.file_size >= PIPELINE_THRESH:
+                        _pipeline_hash(fh, sha1_obj, md5_obj, sha256_obj,
+                                       cancel, CHUNK)
+                    else:
+                        while True:
+                            if cancel.is_set():
+                                raise RuntimeError("CANCELLED")
+                            buf = fh.read(CHUNK)
+                            if not buf:
+                                break
+                            sha1_obj.update(buf)
+                            if md5_obj:    md5_obj.update(buf)
+                            if sha256_obj: sha256_obj.update(buf)
+
+            entry_elapsed = time.monotonic() - t_entry
+            if entry_elapsed >= ENTRY_SLOW_S:
+                unc_mb = entry.file_size / (1024*1024)
+                slow_entries.append(
+                    entry.filename + " ("
+                    + f"{unc_mb:.0f}" + " MB uncomp, "
+                    + f"{entry_elapsed:.1f}" + "s)")
+
+            crc32_hex = f"{entry.CRC & 0xFFFFFFFF:08x}"
+            file_size = entry.file_size
+
+            date_str = None
+            if incl_date and entry.date_time and len(entry.date_time) >= 6:
+                yr, mo, dy, h, mi, sc = entry.date_time[:6]
                 try:
-                    yr, mo, dy = raw[:10].split("-")
-                    h, mi, s   = raw[11:19].split(":")
-                    date_str   = f"{yr}/{mo}/{dy} {h}-{mi}-{s}"
+                    date_str = (str(yr) + "/" + f"{mo:02d}" + "/" +
+                                f"{dy:02d}" + " " + f"{h:02d}" + "-" +
+                                f"{mi:02d}" + "-" + f"{sc:02d}")
                 except Exception:
                     pass
 
-        # Extract single file to stdout, hash the decompressed stream
-        sha1_obj   = hashlib.sha1()
-        md5_obj    = hashlib.md5()    if include_md5    else None
-        sha256_obj = hashlib.sha256() if include_sha256 else None
-        try:
-            proc = subprocess.Popen(
-                [exe, "e", "-so", zip_path, rom_name],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            while True:
+            results.append((
+                entry.filename.replace("\\", "/"),
+                file_size, crc32_hex,
+                sha1_obj.hexdigest(),
+                md5_obj.hexdigest()    if md5_obj    else None,
+                sha256_obj.hexdigest() if sha256_obj else None,
+                date_str,
+            ))
+
+    try:
+        if use_bytesio:
+            # ── SMALL PATH ────────────────────────────────────────────────
+            if cancel.is_set():
+                raise RuntimeError("CANCELLED")
+            with io.open(zip_path, "rb") as f:
+                raw_bytes = f.read()
+            # Post-consume throttle: rate-limit AFTER the read so the actual
+            # read happens at full speed; the sleep falls between zips.
+            if throttle and raw_bytes:
+                throttle.consume(len(raw_bytes), cancel=cancel)
+            if cancel.is_set():
+                raise RuntimeError("CANCELLED")
+            bio = io.BytesIO(raw_bytes)
+            del raw_bytes   # drop the duplicate; BytesIO holds its own copy
+            with _zipfile_mod.ZipFile(bio, "r") as zf:
+                _hash_entries(zf)           # BytesIO path — no raw_fh
+        else:
+            # ── LARGE PATH ────────────────────────────────────────────────
+            while not _LARGE_ZIP_LOCK.acquire(timeout=0.5):
                 if cancel.is_set():
-                    proc.kill()
                     raise RuntimeError("CANCELLED")
-                buf = proc.stdout.read(4 * 1024 * 1024)
-                if not buf:
-                    break
-                sha1_obj.update(buf)
-                if md5_obj:    md5_obj.update(buf)
-                if sha256_obj: sha256_obj.update(buf)
-            proc.wait(timeout=120)
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(
-                f"7z extract failed for '{rom_name}' in "
-                f"{os.path.basename(zip_path)}: {exc}")
+            lock_acquired = True
+            if cancel.is_set():
+                raise RuntimeError("CANCELLED")
+            raw_fh = io.open(zip_path, "rb", buffering=STREAM_OPEN_BUF)
+            try:
+                with _zipfile_mod.ZipFile(raw_fh, "r") as zf:
+                    _hash_entries(zf, raw_fh_=raw_fh)   # stream path — pass raw_fh
+            finally:
+                raw_fh.close()
+                _LARGE_ZIP_LOCK.release()
+                lock_acquired = False
 
-        results.append((rom_name, file_size, crc32_hex,
-                        sha1_obj.hexdigest(),
-                        md5_obj.hexdigest()    if md5_obj    else None,
-                        sha256_obj.hexdigest() if sha256_obj else None,
-                        date_str))
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to read " + os.path.basename(zip_path) + ": " + str(exc))
+    finally:
+        if lock_acquired:
+            _LARGE_ZIP_LOCK.release()
 
-    return results
+    # Sort results by rom_name for deterministic dat output
+    results.sort(key=lambda r: r[0].lower())
+
+    # Diagnostic string
+    elapsed = time.monotonic() - t_start
+    mb_read = zip_size / (1024 * 1024)
+    if elapsed > 0:
+        rate_mbs = mb_read / elapsed
+        path_tag = "mem" if use_bytesio else "stream"
+        diag = (f"{mb_read:.1f} MB in {elapsed:.1f}s = {rate_mbs:.1f} MB/s"
+                f" ({len(results)} entries, {path_tag})")
+        if rate_mbs < SLOW_THRESH and mb_read > 1.0:
+            diag = "[SLOW] " + diag
+        if slow_entries:
+            diag += "  SLOW ENTRIES: " + "; ".join(slow_entries[:5])
+            if len(slow_entries) > 5:
+                diag += " ...+" + str(len(slow_entries)-5) + " more"
+    else:
+        diag = ""
+
+    return results, diag
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1004,6 +1445,26 @@ def process(s: "Settings", ui_queue,
 
     max_workers = max(1, min(8, int(s.threads))) if s.multithread else 1
 
+    # ── Network bandwidth throttle ───────────────────────────────────────────
+    # Target: leave ~15% of NIC capacity free for other processes.
+    if s.net_cap_mbps > 0:
+        _net_rate = s.net_cap_mbps * 1_000_000 / 8   # Mbit/s → bytes/s
+    else:
+        _net_rate = _detect_net_cap_bytes_per_sec(pct=0.85)
+    throttle = _BandwidthThrottle(_net_rate)
+    if _net_rate > 0:
+        _cap_mbs = _net_rate / (1_000_000 / 8)
+        ui_queue.put(("status",
+            "Network cap: " + f"{_cap_mbs:.0f}" + " Mbit/s  ("
+            + ("auto-detected" if s.net_cap_mbps == 0 else "manual") + ")"
+            + "  |  BytesIO threshold: " + str(BYTESIO_THRESHOLD // (1024*1024)) + " MB"
+            + "  |  Large-zip serialised (SMB lock active)"))
+    else:
+        ui_queue.put(("status",
+            "Network cap: unlimited  (psutil not installed or NIC undetected)"
+            + "  |  BytesIO threshold: " + str(BYTESIO_THRESHOLD // (1024*1024)) + " MB"
+            + "  |  Large-zip serialised (SMB lock active)"))
+
     # ── Discover immediate children of input_root ────────────────────────
     ui_queue.put(("status", "Phase 1 of 2 — Discovering folders and files... (please wait)"))
     try:
@@ -1245,8 +1706,10 @@ def process(s: "Settings", ui_queue,
 
         if s.incremental and job_game_index:
             # Incremental mode: carry forward unchanged items, hash only new/changed
-            data, done_items, job_carried, job_hashed, job_errs =                 build_incremental_data(items, job_game_index, s,
-                                       hard_stop, ui_queue, done_items)
+            data, done_items, job_carried, job_hashed, job_errs = \
+                build_incremental_data(items, job_game_index, s,
+                                       hard_stop, ui_queue, done_items,
+                                       throttle=throttle)
             errors.extend(job_errs)
             total_carried += job_carried
             total_hashed  += job_hashed
@@ -1254,61 +1717,116 @@ def process(s: "Settings", ui_queue,
                 incomplete = True
         else:
             # Full hash mode
+            # ── Sort items by (parent_dir, basename) so items from the same
+            # subfolder are processed consecutively.  This lets us emit
+            # "subfolder" log markers, and also improves cache locality.
+            items = sorted(items,
+                           key=lambda p: (os.path.dirname(p).lower(),
+                                          os.path.basename(p).lower()))
+
             def do_mixed(fp):
                 return fp, hash_file(fp, s.include_md5,
                                       s.include_sha256,
-                                      hard_stop), None
+                                      hard_stop,
+                                      throttle=throttle), None, ""
 
             def do_zipped(zp):
-                return zp, analyze_zip(zp, s.include_md5,
-                                        s.include_sha256,
-                                        s.incl_file_date,
-                                        hard_stop, s.sevenzip_path), None
+                res_list, diag = analyze_zip(zp, s.include_md5,
+                                              s.include_sha256,
+                                              s.incl_file_date,
+                                              hard_stop, s.sevenzip_path,
+                                              throttle=throttle)
+                return zp, res_list, None, diag
 
             work_fn = do_mixed if is_mixed else do_zipped
 
             def safe_work(item_path):
                 try:
-                    p, result, _ = work_fn(item_path)
-                    return p, result, None
+                    p, result, _, diag = work_fn(item_path)
+                    return p, result, None, diag
                 except Exception as exc:
                     msg = str(exc)
-                    return item_path, None, ("CANCELLED" if "CANCELLED" in msg else repr(exc))
+                    return item_path, None, ("CANCELLED" if "CANCELLED" in msg else repr(exc)), ""
+
+            # Helper: emit a subfolder header when parent dir changes
+            _last_subdir = [None]
+            def _maybe_emit_subfolder(item_path):
+                parent = os.path.dirname(item_path)
+                if parent != _last_subdir[0]:
+                    _last_subdir[0] = parent
+                    try:
+                        rel = os.path.relpath(parent, folder_path)
+                    except ValueError:
+                        rel = parent
+                    ui_queue.put(("subfolder", rel))
 
             if max_workers == 1:
                 for item in items:
                     if hard_stop.is_set():
                         incomplete = True; break
-                    ui_queue.put(("item", os.path.basename(item), done_items + 1))
-                    _, result, err_s = safe_work(item)
+                    bname = os.path.basename(item)
+                    _maybe_emit_subfolder(item)
+                    _, result, err_s, diag = safe_work(item)
                     if err_s == "CANCELLED":
                         incomplete = True; break
                     done_items += 1
                     ui_queue.put(("progress", done_items))
+                    if done_items % 100 == 0:
+                        gc.collect()   # prevent heap growth from accumulated zlib/zipfile objects
                     if err_s or result is None:
-                        errors.append(f"ERROR: {item} :: {err_s}"); continue
+                        err_detail = err_s or "unknown error"
+                        errors.append("ERROR: " + item + " :: " + err_detail)
+                        ui_queue.put(("item_error", bname, err_detail))
+                        continue
+                    log_detail = ("  (" + diag + ")") if diag else ""
+                    ui_queue.put(("item_hashed", bname, log_detail))
                     data[item] = result
             else:
-                with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                    fmap = {ex.submit(safe_work, it): it for it in items}
-                    for fut in as_completed(fmap):
+                # Non-blocking executor — do NOT use context manager so Hard Stop
+                # can escape even if worker threads are blocked on network I/O.
+                # Items are pre-sorted by directory so subfolder markers stay
+                # roughly aligned with their zip entries even in async completion.
+                ex = ThreadPoolExecutor(max_workers=max_workers)
+                try:
+                    fmap    = {ex.submit(safe_work, it): it for it in items}
+                    pending = set(fmap.keys())
+                    # Build dir→item mapping for subfolder tracking by completion
+                    item_dir = {it: os.path.dirname(it) for it in items}
+                    while pending:
                         if hard_stop.is_set():
                             incomplete = True
-                            for ft in fmap: ft.cancel()
+                            for ft in pending: ft.cancel()
                             break
-                        item = fmap[fut]
-                        ui_queue.put(("item", os.path.basename(item), done_items + 1))
-                        try:
-                            _, result, err_s = fut.result()
-                        except Exception as exc:
-                            result, err_s = None, repr(exc)
-                        if err_s == "CANCELLED":
-                            incomplete = True; break
-                        done_items += 1
-                        ui_queue.put(("progress", done_items))
-                        if err_s or result is None:
-                            errors.append(f"ERROR: {item} :: {err_s}"); continue
-                        data[item] = result
+                        done_set, pending = _cf_wait(
+                            pending, timeout=0.5,
+                            return_when=FIRST_COMPLETED)
+                        for fut in done_set:
+                            item  = fmap[fut]
+                            bname = os.path.basename(item)
+                            _maybe_emit_subfolder(item)
+                            try:
+                                _, result, err_s, diag = fut.result()
+                            except Exception as exc:
+                                result, err_s, diag = None, repr(exc), ""
+                            if err_s == "CANCELLED":
+                                incomplete = True
+                                for ft in pending: ft.cancel()
+                                pending = set()
+                                break
+                            done_items += 1
+                            ui_queue.put(("progress", done_items))
+                            if done_items % 100 == 0:
+                                gc.collect()
+                            if err_s or result is None:
+                                err_detail = err_s or "unknown error"
+                                errors.append("ERROR: " + item + " :: " + err_detail)
+                                ui_queue.put(("item_error", bname, err_detail))
+                                continue
+                            log_detail = ("  (" + diag + ")") if diag else ""
+                            ui_queue.put(("item_hashed", bname, log_detail))
+                            data[item] = result
+                finally:
+                    ex.shutdown(wait=False)   # release threads immediately on hard stop
 
         # ── Write dat ─────────────────────────────────────────────────
         dat_filename = make_dat_filename(dat_name, header_date, incomplete)
@@ -1374,6 +1892,19 @@ class App:
         self.root.title("Eggman's Datfile Creator Suite")
         self.root.geometry("920x800+125+125")
         self.root.minsize(920, 800)
+
+        # ── Hard dependency check — must happen before building any UI ────────
+        if not _DEPS_OK:
+            self.root.withdraw()
+            messagebox.showerror(
+                "Missing required packages",
+                "The following pip packages are required and must be installed "
+                "before running this application:\n\n"
+                "  pip install zstandard zipfile-zstd\n\n"
+                "Error detail:\n  " + _DEPS_ERROR,
+                parent=self.root)
+            self.root.after(100, self.root.destroy)
+            return
 
         self.settings    = load_settings()
         self.ui_queue    = queue.Queue()
@@ -1834,6 +2365,7 @@ class App:
         self.var_sha256      = tk.BooleanVar()
         self.var_multithread = tk.BooleanVar(value=True)
         self.var_threads     = tk.IntVar(value=4)
+        self.var_net_cap     = tk.IntVar(value=0)
 
         ck2 = ttk.Frame(of, style="Options.TFrame")
         ck2.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4,0))
@@ -1857,6 +2389,13 @@ class App:
         self.spin_threads = ttk.Spinbox(ck2, from_=1, to=8,
                                         textvariable=self.var_threads, width=4)
         self.spin_threads.pack(side="left", padx=(4, 0))
+        ttk.Separator(ck2, orient="vertical").pack(
+            side="left", fill="y", padx=(10, 8))
+        ttk.Label(ck2, text="Net cap Mbit/s (0=auto):",
+                  style="Options.TLabel").pack(side="left")
+        self.spin_net_cap = ttk.Spinbox(ck2, from_=0, to=100000,
+                                        textvariable=self.var_net_cap, width=7)
+        self.spin_net_cap.pack(side="left", padx=(4, 0))
 
         # Extension filters
         ef = ttk.Frame(of, style="Options.TFrame")
@@ -2066,6 +2605,7 @@ class App:
         self._on_incremental_toggle()
         self.var_multithread.set(s.multithread)
         self.var_threads.set(s.threads)
+        self.var_net_cap.set(s.net_cap_mbps)
         self._on_options_change()
         self._on_mt_toggle()
 
@@ -2101,6 +2641,7 @@ class App:
             retire_old_dats        = bool(self.var_retire.get()),
             multithread  = bool(self.var_multithread.get()),
             threads      = max(1, min(8, int(self.var_threads.get() or 1))),
+            net_cap_mbps = max(0, int(self.var_net_cap.get() or 0)),
         )
 
     # ── Browse ───────────────────────────────────────────────────────────────
@@ -2710,77 +3251,32 @@ def _read_dat_index(dat_path: str) -> Tuple[dict, dict, str]:
 
 # ── CRC fast-check (Zipped) ──────────────────────────────────────────────────
 
-def _zip_crc_fast(zip_path: str, sevenzip_path: str) -> Tuple[int, str]:
+def _zip_crc_fast(zip_path: str, sevenzip_path: str = "") -> Tuple[int, str]:
     """
-    Read the CRC32 of (first) file inside a zip using '7z l -slt'.
-    Returns (file_size_uncompressed, crc32_lower_hex) or (0, "") on failure.
+    Read CRC32 and total uncompressed size from zip central directory.
+    Returns (total_uncompressed_size, xor_crc_hex) or (0, "") on failure.
 
-    This is intentionally cheap: we only need the CRC of the archive as a
-    whole-archive fingerprint — we take the CRC of the first listed file,
-    which is stable for deterministically-packed archives (TorrentZip / RVZSTD).
-    For multi-file zips we XOR all CRCs together as a quick fingerprint.
-    The result is compared only against the stored value from the dat; it is
-    not used as a cryptographic hash.
+    Uses _zipfile_mod (zipfile_zstd) — reads only the central directory,
+    no decompression.  No subprocess, no temp files.
+
+    sevenzip_path is kept for call-site compatibility but is not used.
     """
-    import subprocess
-    exe = sevenzip_path.strip() or r"C:\Program Files\7-Zip-Zstandard\7z.exe"
-    if not os.path.isfile(exe):
-        return 0, ""
     try:
-        r = subprocess.run(
-            [exe, "l", "-slt", "-ba", zip_path],
-            capture_output=True, timeout=30)
+        total_size = 0
+        crc_xor    = 0
+        found      = False
+        with _zipfile_mod.ZipFile(zip_path, "r") as zf:
+            for entry in zf.infolist():
+                if entry.is_dir():
+                    continue
+                total_size += entry.file_size
+                crc_xor    ^= entry.CRC
+                found       = True
+        if not found:
+            return 0, ""
+        return total_size, f"{crc_xor & 0xFFFFFFFF:08x}"
     except Exception:
         return 0, ""
-    if r.returncode not in (0, 1):
-        return 0, ""
-
-    listing = r.stdout.decode("utf-8", errors="replace")
-    total_size = 0
-    crc_xor    = 0
-    found      = False
-    cur: dict  = {}
-
-    for line in listing.splitlines():
-        line = line.strip()
-        if not line:
-            if cur:
-                attr = cur.get("attributes", "")
-                if not attr.upper().startswith("D") and cur.get("path"):
-                    try:
-                        total_size += int(cur.get("size", "0"))
-                    except ValueError:
-                        pass
-                    raw_crc = cur.get("crc", "")
-                    if raw_crc:
-                        try:
-                            crc_xor ^= int(raw_crc, 16)
-                            found = True
-                        except ValueError:
-                            pass
-                cur = {}
-            continue
-        if "=" in line:
-            k, _, v = line.partition("=")
-            cur[k.strip().lower()] = v.strip()
-    if cur:
-        attr = cur.get("attributes", "")
-        if not attr.upper().startswith("D") and cur.get("path"):
-            try:
-                total_size += int(cur.get("size", "0"))
-            except ValueError:
-                pass
-            raw_crc = cur.get("crc", "")
-            if raw_crc:
-                try:
-                    crc_xor ^= int(raw_crc, 16)
-                    found = True
-                except ValueError:
-                    pass
-
-    if not found:
-        return 0, ""
-    return total_size, f"{crc_xor & 0xFFFFFFFF:08x}"
 
 
 # ── Dat validation (name-only cross-check) ───────────────────────────────────
@@ -2928,7 +3424,8 @@ def build_incremental_data(items: List[str], game_index: dict,
                            s: "Settings",
                            hard_stop: threading.Event,
                            ui_queue,
-                           done_so_far: int) -> Tuple[dict, int, int, int, list]:
+                           done_so_far: int,
+                           throttle: Optional["_BandwidthThrottle"] = None) -> Tuple[dict, int, int, int, list]:
     """
     For each item in `items`:
       - If it matches an existing dat entry (filename+size+CRC for Zipped,
@@ -3075,9 +3572,12 @@ def build_incremental_data(items: List[str], game_index: dict,
                     carried = True
                 else:
                     # Full analyze
-                    data[item] = analyze_zip(
+                    _res, _diag = analyze_zip(
                         item, s.include_md5, s.include_sha256,
-                        s.incl_file_date, hard_stop, s.sevenzip_path)
+                        s.incl_file_date, hard_stop, s.sevenzip_path,
+                        throttle=throttle)
+                    data[item] = _res
+                    _hash_diag = _diag
             else:
                 carry_result = _try_carry_mixed(item)
                 if carry_result is not None:
@@ -3085,20 +3585,25 @@ def build_incremental_data(items: List[str], game_index: dict,
                     carried = True
                 else:
                     data[item] = hash_file(
-                        item, s.include_md5, s.include_sha256, hard_stop)
+                        item, s.include_md5, s.include_sha256, hard_stop,
+                        throttle=throttle)
+                    _hash_diag = ""
 
             if carried:
                 carried_count += 1
                 ui_queue.put(("item_carried", fname))
             else:
                 hashed_count += 1
-                ui_queue.put(("item_hashed", fname))
+                ui_queue.put(("item_hashed", fname,
+                               ("  (" + _hash_diag + ")") if _hash_diag else ""))
 
         except Exception as exc:
             msg = str(exc)
             if "CANCELLED" in msg:
                 break
-            errors.append(f"ERROR: {item} :: {repr(exc)}")
+            err_detail = repr(exc)
+            errors.append("ERROR: " + item + " :: " + err_detail)
+            ui_queue.put(("item_error", fname, err_detail))
 
         done_count += 1
         ui_queue.put(("progress", done_count))
@@ -3152,6 +3657,14 @@ class RunProgressWindow(tk.Toplevel):
         self.done_items   = 0
         self.total_jobs   = 0
         self.dats_written = 0
+        self._warn_count  = 0            # errors/warnings encountered this run
+
+        # Net speed polling state (psutil)
+        self._net_after    = None
+        self._net_last_rx  = 0
+        self._net_last_tx  = 0
+        self._net_last_t   = 0.0
+        self._run_start_t  = 0.0   # monotonic time when run started (for elapsed)
 
         self.title("Eggman\'s Datfile Creator Suite — Run Progress")
         self.geometry("860x580+200+400")
@@ -3186,14 +3699,23 @@ class RunProgressWindow(tk.Toplevel):
             top, orient="horizontal", mode="determinate")
         self.progress.grid(row=2, column=0, sticky="ew", pady=(4, 2))
 
-        self.var_current = tk.StringVar(value="Current item: (none)")
-        ttk.Label(top, textvariable=self.var_current,
+        # Network throughput display (updated once/sec via psutil)
+        self.var_net_speed = tk.StringVar(value="Network: —")
+        ttk.Label(top, textvariable=self.var_net_speed,
                   style="Progress.TLabel",
-                  foreground="#5A5A5A").grid(row=3, column=0, sticky="w")
+                  foreground="#5A5A5A",
+                  font=("Consolas", 8)).grid(row=3, column=0, sticky="w")
+
+        # Elapsed time display (updated once/sec alongside network)
+        self.var_elapsed = tk.StringVar(value="Elapsed:  —")
+        ttk.Label(top, textvariable=self.var_elapsed,
+                  style="Progress.TLabel",
+                  foreground="#5A5A5A",
+                  font=("Consolas", 8)).grid(row=4, column=0, sticky="w")
 
         # Spinner — shown during Phase 1 discovery, hidden during Phase 2
         spin_row = ttk.Frame(top, style="Progress.TFrame")
-        spin_row.grid(row=4, column=0, sticky="w", pady=(2, 0))
+        spin_row.grid(row=5, column=0, sticky="w", pady=(2, 0))
         self.var_spinner = tk.StringVar(value="")
         self._lbl_spinner = tk.Label(spin_row,
             textvariable=self.var_spinner,
@@ -3268,21 +3790,25 @@ class RunProgressWindow(tk.Toplevel):
     def reset(self):
         """Called at the start of each run to clear state."""
         self._spin_stop()
+        self._net_stop()
         self.progress.stop()
         self.progress.configure(mode="determinate")
         self._log_lines.clear()
         self.lst.delete(0, tk.END)
         self.total_items = 0; self.done_items = 0
         self.total_jobs  = 0; self.dats_written = 0
+        self._warn_count = 0
         self.progress["value"]   = 0
         self.progress["maximum"] = 1
         start_msg = getattr(self.app, "_start_msg", "Starting...")
         self.var_status.set(start_msg)
         self.var_counts.set("Items: 0/0  |  Folders: 0  |  Dats written: 0")
-        self.var_current.set("Current item: (none)")
+        self.var_net_speed.set("Network: —")
+        self.var_elapsed.set("Elapsed:  —")
         self.btn_preview.configure(state="disabled")
         self.btn_rp_soft.configure(state="normal")
         self.btn_rp_hard.configure(state="normal")
+        self._net_start()
         self.deiconify()
         self.lift()
 
@@ -3308,10 +3834,7 @@ class RunProgressWindow(tk.Toplevel):
         elif kind == "scan":
             folder_path = str(msg[1])
             folder_name = os.path.basename(folder_path)
-            self.var_current.set("Phase 1 — Discovering: " + folder_path)
-            # Log each discovered folder immediately (fix 3)
             self._log_entry("  Scanning: " + folder_name, fg="#9A6A30")
-            # Start indeterminate bar + spinner on first scan message (fix 2)
             if self._spinner_after is None:
                 if self.progress["mode"] == "determinate":
                     self.progress.configure(mode="indeterminate")
@@ -3319,7 +3842,6 @@ class RunProgressWindow(tk.Toplevel):
                 self._spin_start()
         elif kind == "totals":
             self.total_jobs, self.total_items = msg[1], msg[2]
-            # Phase 1 complete — stop spinner, switch bar to determinate
             self._spin_stop()
             self.progress.stop()
             self.progress.configure(mode="determinate")
@@ -3329,14 +3851,27 @@ class RunProgressWindow(tk.Toplevel):
         elif kind == "folder":
             self._log_entry(">> " + str(msg[1]) + "  (" + str(msg[2]) + " item(s))",
                             fg="#1e90ff")
+        elif kind == "subfolder":
+            rel = str(msg[1])
+            if rel == "." or rel == "":
+                label = "[root]"
+            else:
+                label = "[dir] " + rel
+            self._log_entry("  " + label, fg="#9A6A30")
         elif kind == "item":
-            self.var_current.set(
-                "Current item: " + str(msg[1])
-                + "  (" + str(msg[2]) + "/" + str(self.total_items) + ")")
-        elif kind == "item_carried":
-            self.var_current.set("Carried: " + str(msg[1]))
+            pass   # no longer displayed — completion logged via item_hashed/item_error
         elif kind == "item_hashed":
-            self.var_current.set("Hashing: " + str(msg[1]))
+            detail = str(msg[2]) if len(msg) > 2 else ""
+            self._log_entry("    \u2713 " + str(msg[1]) + detail, fg="#208030")
+        elif kind == "item_carried":
+            self._log_entry("    ~ " + str(msg[1]) + "  (carried)", fg="#808080")
+        elif kind == "item_error":
+            self._warn_count += 1
+            detail = str(msg[2]) if len(msg) > 2 else ""
+            entry  = "    [ERROR] " + str(msg[1])
+            if detail:
+                entry += " :: " + detail
+            self._log_entry(entry, fg="#CC2020")
         elif kind == "progress":
             self.done_items = msg[1]
             self.progress["value"] = self.done_items
@@ -3355,20 +3890,35 @@ class RunProgressWindow(tk.Toplevel):
             self.done_items   = done
             self.dats_written = written
             self._update_counts()
+            self._net_stop()
+            # Freeze elapsed at final time
+            elapsed_s = time.monotonic() - self._run_start_t
+            h  = int(elapsed_s // 3600)
+            m  = int((elapsed_s % 3600) // 60)
+            s  = int(elapsed_s % 60)
+            if h:
+                elapsed_str = f"{h}h {m:02d}m {s:02d}s"
+            else:
+                elapsed_str = f"{m}m {s:02d}s"
+            self.var_elapsed.set("Elapsed:  " + elapsed_str + "  (finished)")
             result = "Done" if ok else "Stopped"
             status = (result + ". Wrote " + str(written) + " dat(s) / "
                       + str(done) + "/" + str(total) + " item(s) in "
                       + f"{elapsed:.1f}s.")
             self.var_status.set(status)
             self._log_entry(status)
-            if errors:
-                self._log_entry("Errors/warnings: " + str(len(errors)))
+            total_warns = self._warn_count + len(errors)
+            if total_warns:
+                self._log_entry("[SUMMARY] " + str(total_warns)
+                                + " error(s)/warning(s) encountered.", fg="#CC2020")
                 for ln in errors[:10]:
-                    self._log_entry("  " + ln)
+                    self._log_entry("  " + ln, fg="#CC2020")
                 if len(errors) > 10:
-                    self._log_entry("  ... and " + str(len(errors)-10) + " more")
+                    self._log_entry(
+                        "  ... and " + str(len(errors) - 10) + " more (save log to see all)",
+                        fg="#CC2020")
             else:
-                self._log_entry("No errors reported.")
+                self._log_entry("[SUMMARY] No errors reported.", fg="#208030")
             if self.app._preview_results:
                 self.btn_preview.configure(state="normal")
             self.btn_rp_soft.configure(state="disabled")
@@ -3392,6 +3942,64 @@ class RunProgressWindow(tk.Toplevel):
             self.after_cancel(self._spinner_after)
             self._spinner_after = None
         self.var_spinner.set("")
+
+    # ── Network throughput display ────────────────────────────────────────────
+
+    def _net_start(self):
+        """Begin 1-second network throughput polling."""
+        self._run_start_t = time.monotonic()
+        if not _PSUTIL_OK or _psutil is None:
+            self.var_net_speed.set("Network: (psutil not installed)")
+            self._net_after = self.after(1000, self._tick_net_speed)
+            return
+        try:
+            c = _psutil.net_io_counters()
+            self._net_last_rx = c.bytes_recv
+            self._net_last_tx = c.bytes_sent
+        except Exception:
+            self._net_last_rx = 0
+            self._net_last_tx = 0
+        self._net_last_t = time.monotonic()
+        self._net_after  = self.after(1000, self._tick_net_speed)
+
+    def _tick_net_speed(self):
+        """Poll net_io_counters and update the Mbit/s and elapsed displays."""
+        # Update elapsed regardless of psutil
+        elapsed_s = time.monotonic() - self._run_start_t
+        h  = int(elapsed_s // 3600)
+        m  = int((elapsed_s % 3600) // 60)
+        s  = int(elapsed_s % 60)
+        if h:
+            elapsed_str = f"{h}h {m:02d}m {s:02d}s"
+        else:
+            elapsed_str = f"{m}m {s:02d}s"
+        self.var_elapsed.set("Elapsed:  " + elapsed_str)
+
+        if _PSUTIL_OK and _psutil is not None:
+            try:
+                c   = _psutil.net_io_counters()
+                now = time.monotonic()
+                dt  = now - self._net_last_t
+                if dt > 0:
+                    rx_bps = (c.bytes_recv - self._net_last_rx) / dt
+                    tx_bps = (c.bytes_sent - self._net_last_tx) / dt
+                    rx_mb  = rx_bps * 8 / 1_000_000
+                    tx_mb  = tx_bps * 8 / 1_000_000
+                    self.var_net_speed.set(
+                        "Network:  \u2193 " + f"{rx_mb:6.1f}" +
+                        " Mbit/s   \u2191 " + f"{tx_mb:6.1f}" + " Mbit/s")
+                self._net_last_rx = c.bytes_recv
+                self._net_last_tx = c.bytes_sent
+                self._net_last_t  = now
+            except Exception:
+                pass
+        self._net_after = self.after(1000, self._tick_net_speed)
+
+    def _net_stop(self):
+        """Cancel the net speed polling loop."""
+        if self._net_after:
+            self.after_cancel(self._net_after)
+            self._net_after = None
 
     def _update_counts(self):
         self.var_counts.set(
@@ -3436,6 +4044,7 @@ class RunProgressWindow(tk.Toplevel):
                 "Use Soft Stop or Hard Stop before closing.",
                 parent=self)
             return
+        self._net_stop()
         self.withdraw()
 
 # ═══════════════════════════════════════════════════════════════════════════
