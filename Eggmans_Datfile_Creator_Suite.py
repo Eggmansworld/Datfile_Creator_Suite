@@ -441,34 +441,41 @@ def _get_entry_data_offset(raw_fh, entry) -> int:
     return entry.header_offset + 30 + len(entry.filename.encode('utf-8')) + len(entry.extra)
 
 
-def _direct_hash_entry(raw_fh, entry, sha1_obj, md5_obj, sha256_obj, cancel, chunk_size):
+def _direct_hash_entry(raw_fh, entry, sha1_obj, md5_obj, sha256_obj,
+                       cancel, chunk_size, is_mem_path=False):
     """
-    Hash a zip entry by reading its compressed bytes in ONE large sequential
-    read, then decompressing from memory.
+    Hash a zip entry by reading its compressed bytes in ONE large read,
+    then decompressing from memory.
 
-    This replaces zf.open(entry) for the stream path.  The critical problem
-    with zf.open() over SMB is that Python's ZipExtFile._read2() uses
-    MIN_READ_SIZE=4096 bytes per read call.  For a 3MB entry that means
-    ~750 sequential 4096-byte reads, each of which can cause SMB credit stalls
-    in between.  One raw_fh.read(compress_size) = one large SMB request per
-    entry — exactly what RomVault's ZipFileOpenReadStream does.
+    For the STREAM path (is_mem_path=False): raw_fh is a network file.
+    ONE raw_fh.read(compress_size) = one large SMB request per entry,
+    eliminating the 4096-byte-read stalls that ZipExtFile._read2() causes.
+
+    For the BytesIO path (is_mem_path=True): raw_fh IS the BytesIO that
+    already holds the entire zip in RAM.  bio.read(compress_size) is an
+    instant memcpy.  The STREAM_ENTRY_MEM guard is skipped because the
+    data is already in memory, and we always do one bulk read + one native
+    decompression call (no Python-level 4096-byte chunking via zipfile_zstd).
+
+    This is the critical fix for ZSTD entries with extreme compression
+    ratios (e.g. 850 MB uncompressed from 53 MB compressed): feeding the
+    zstandard streaming decompressor in 4096-byte chunks causes it to stall
+    on incomplete ZSTD blocks, accumulating ~13,000 Python-call overheads.
+    One bulk read + ZstdDecompressor.decompress() runs at native C speed.
 
     Supports method 0 (Stored), method 8 (Deflate), method 93 (RVZSTD).
-    Falls back to zf.open() for anything else (handled by caller).
-
-    Returns True on success, False if method is unsupported (caller should
-    fall back to zf.open()).
+    Returns False for unsupported methods (caller falls back to zf.open()).
     """
     if entry.compress_type not in (0, 8, 93):
-        return False   # caller falls back to zf.open()
+        return False
     if entry.file_size == 0:
         return True    # nothing to hash; zero-byte empty hash already applied
 
     data_offset = _get_entry_data_offset(raw_fh, entry)
 
-    if entry.compress_size > STREAM_ENTRY_MEM:
-        # Entry is too large to hold in RAM — use streaming reads in chunks.
-        # Still use direct raw_fh reads (large chunks, not 4096-byte reads).
+    if not is_mem_path and entry.compress_size > STREAM_ENTRY_MEM:
+        # Entry too large to hold in a new RAM buffer on the stream path.
+        # Use chunked reads (still large chunks — not 4096-byte reads).
         raw_fh.seek(data_offset)
         remaining = entry.compress_size
         if cancel.is_set():
@@ -507,7 +514,6 @@ def _direct_hash_entry(raw_fh, entry, sha1_obj, md5_obj, sha256_obj, cancel, chu
 
         elif entry.compress_type == 93:
             dctx = _zstd_lib.ZstdDecompressor()
-            # Wrap the raw limited region in a reader
             lim = _LimitedReader(raw_fh, entry.compress_size)
             with dctx.stream_reader(lim, read_size=chunk_size) as reader:
                 while True:
@@ -519,11 +525,13 @@ def _direct_hash_entry(raw_fh, entry, sha1_obj, md5_obj, sha256_obj, cancel, chu
                     if sha256_obj: sha256_obj.update(out)
         return True
 
-    # ── Normal path: ONE large read of entire compressed entry ───────────────
+    # ── ONE large read of entire compressed entry ─────────────────────────────
+    # For stream path: one SMB request.
+    # For BytesIO path: one RAM memcpy — replaces 4096-byte MIN_READ_SIZE loop.
     raw_fh.seek(data_offset)
     if cancel.is_set():
         raise RuntimeError("CANCELLED")
-    compressed = raw_fh.read(entry.compress_size)   # ← the key: ONE SMB request
+    compressed = raw_fh.read(entry.compress_size)
 
     if entry.compress_type == 0:
         sha1_obj.update(compressed)
@@ -531,35 +539,41 @@ def _direct_hash_entry(raw_fh, entry, sha1_obj, md5_obj, sha256_obj, cancel, chu
         if sha256_obj: sha256_obj.update(compressed)
 
     elif entry.compress_type == 8:
-        dec = zlib.decompressobj(-15)
-        for i in range(0, len(compressed), chunk_size):
-            if cancel.is_set(): raise RuntimeError("CANCELLED")
-            out = dec.decompress(compressed[i:i + chunk_size])
+        if is_mem_path:
+            # All compressed bytes already in RAM — one native C call
+            out = zlib.decompress(compressed, -15)
             if out:
                 sha1_obj.update(out)
                 if md5_obj:    md5_obj.update(out)
                 if sha256_obj: sha256_obj.update(out)
-        try:
-            out = dec.flush()
-            if out:
-                sha1_obj.update(out)
-                if md5_obj:    md5_obj.update(out)
-                if sha256_obj: sha256_obj.update(out)
-        except Exception:
-            pass
+        else:
+            dec = zlib.decompressobj(-15)
+            for i in range(0, len(compressed), chunk_size):
+                if cancel.is_set(): raise RuntimeError("CANCELLED")
+                out = dec.decompress(compressed[i:i + chunk_size])
+                if out:
+                    sha1_obj.update(out)
+                    if md5_obj:    md5_obj.update(out)
+                    if sha256_obj: sha256_obj.update(out)
+            try:
+                out = dec.flush()
+                if out:
+                    sha1_obj.update(out)
+                    if md5_obj:    md5_obj.update(out)
+                    if sha256_obj: sha256_obj.update(out)
+            except Exception:
+                pass
 
     elif entry.compress_type == 93:
         dctx = _zstd_lib.ZstdDecompressor()
-        with dctx.stream_reader(io.BytesIO(compressed), read_size=chunk_size) as reader:
-            while True:
-                if cancel.is_set(): raise RuntimeError("CANCELLED")
-                out = reader.read(chunk_size)
-                if not out: break
-                sha1_obj.update(out)
-                if md5_obj:    md5_obj.update(out)
-                if sha256_obj: sha256_obj.update(out)
+        # decompress() takes the full buffer in one native C call — optimal
+        out = dctx.decompress(compressed, max_output_size=max(entry.file_size, 1))
+        if out:
+            sha1_obj.update(out)
+            if md5_obj:    md5_obj.update(out)
+            if sha256_obj: sha256_obj.update(out)
 
-    del compressed   # free immediately
+    del compressed
     return True
 
 
@@ -696,7 +710,7 @@ def analyze_zip(zip_path: str, include_md5: bool,
 
     slow_entries = []   # [(name, seconds, MB_uncompressed)]
 
-    def _hash_entries(zf, raw_fh_=None):
+    def _hash_entries(zf, raw_fh_=None, is_mem_=False):
         """
         Hash all entries.
         raw_fh_: provided for stream path only — enables _direct_hash_entry
@@ -737,16 +751,20 @@ def analyze_zip(zip_path: str, include_md5: bool,
             t_entry = time.monotonic()
 
             if raw_fh_ is not None:
-                # STREAM PATH: one large raw read per entry via _direct_hash_entry.
+                # STREAM or BYTESIO PATH: one large raw read per entry.
+                # is_mem_path=True tells _direct_hash_entry it's already in RAM —
+                # skip STREAM_ENTRY_MEM guard, use ZstdDecompressor.decompress()
+                # (one native C call) instead of the streaming 4096-byte loop.
                 ok = _direct_hash_entry(raw_fh_, entry, sha1_obj, md5_obj,
-                                        sha256_obj, cancel, CHUNK)
+                                        sha256_obj, cancel, CHUNK,
+                                        is_mem_path=is_mem_)
                 if not ok:
                     # Unknown compression method — fall back to zf.open()
                     with zf.open(entry) as fh:
                         _pipeline_hash(fh, sha1_obj, md5_obj, sha256_obj,
                                        cancel, CHUNK)
-                # Post-consume throttle after the read
-                if throttle and entry.compress_size > 0:
+                # Post-consume throttle only for network (stream) path
+                if not is_mem_ and throttle and entry.compress_size > 0:
                     throttle.consume(entry.compress_size, cancel=cancel)
             else:
                 # BYTESIO PATH: all seeks in RAM, use pipeline for large entries
@@ -811,7 +829,11 @@ def analyze_zip(zip_path: str, include_md5: bool,
             bio = io.BytesIO(raw_bytes)
             del raw_bytes   # drop the duplicate; BytesIO holds its own copy
             with _zipfile_mod.ZipFile(bio, "r") as zf:
-                _hash_entries(zf)           # BytesIO path — no raw_fh
+                # Pass bio as raw_fh_ so _direct_hash_entry does ONE memcpy
+                # read per entry instead of MIN_READ_SIZE=4096 chunk feeds.
+                # is_mem_=True skips STREAM_ENTRY_MEM and uses the fast
+                # ZstdDecompressor.decompress() single-call path for ZSTD.
+                _hash_entries(zf, raw_fh_=bio, is_mem_=True)
         else:
             # ── LARGE PATH ────────────────────────────────────────────────
             while not _LARGE_ZIP_LOCK.acquire(timeout=0.5):
@@ -823,7 +845,7 @@ def analyze_zip(zip_path: str, include_md5: bool,
             raw_fh = io.open(zip_path, "rb", buffering=STREAM_OPEN_BUF)
             try:
                 with _zipfile_mod.ZipFile(raw_fh, "r") as zf:
-                    _hash_entries(zf, raw_fh_=raw_fh)   # stream path — pass raw_fh
+                    _hash_entries(zf, raw_fh_=raw_fh, is_mem_=False)
             finally:
                 raw_fh.close()
                 _LARGE_ZIP_LOCK.release()
