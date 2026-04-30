@@ -96,6 +96,28 @@ STREAM_OPEN_BUF   =   4 * 1024 * 1024  # 4 MB  (stream path only)
 STREAM_ENTRY_MEM  =  64 * 1024 * 1024  # 64 MB max compressed bytes held in RAM per entry
 _LARGE_ZIP_LOCK   = threading.Semaphore(1)
 
+# ── SMB transient-error retry ────────────────────────────────────────────────
+# On Windows, a mid-read SMB disconnect surfaces as [Errno 22] Invalid argument
+# (ERROR_INVALID_PARAMETER) because the file handle goes stale.  Other common
+# codes: 121 = ERROR_SEM_TIMEOUT, 1236 = ERROR_CONNECTION_ABORTED,
+# 10054/10060 = Winsock connection reset / timed out.
+# Retry delays (seconds): 10 → 20 → 40 → 80 → 160  (5 attempts, then give up)
+_SMB_RETRY_DELAYS    = (10, 20, 40, 80, 160)
+_SMB_TRANSIENT_ERRNO = frozenset({22, 121, 1236})
+_SMB_TRANSIENT_WERR  = frozenset({121, 1236, 10054, 10060})
+_SMB_TRANSIENT_MSG   = ("invalid argument", "connection reset",
+                         "timed out", "connection aborted",
+                         "winerror 121", "winerror 1236")
+
+def _is_smb_transient(exc: Exception) -> bool:
+    """Return True if exc looks like a recoverable SMB/network hiccup."""
+    if getattr(exc, "errno",    None) in _SMB_TRANSIENT_ERRNO:
+        return True
+    if getattr(exc, "winerror", None) in _SMB_TRANSIENT_WERR:
+        return True
+    msg = str(exc).lower()
+    return any(pat in msg for pat in _SMB_TRANSIENT_MSG)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  UTILITIES
@@ -1423,13 +1445,16 @@ def make_dat_name(folder_name: str, input_root: str, s: "Settings") -> str:
     Always includes the top-level input folder name between parent and subfolder.
     e.g. parent="Commodore", root="C16-C116-Plus4", folder="[ARK]"
          -> "Commodore - C16-C116-Plus4 - [ARK]"
+    When folder_name == root_name (i.e. the job IS the root), the folder name
+    is not appended — avoids "Mixed - Sir-Tech - Sir-Tech" duplication.
     """
     root_name = os.path.basename(os.path.normpath(input_root))
     parts = []
     if s.parent_name.strip():
         parts.append(s.parent_name.strip())
     parts.append(root_name)
-    parts.append(folder_name)
+    if folder_name != root_name:
+        parts.append(folder_name)
     return " - ".join(parts)
 
 def make_dat_filename(dat_name: str, header_date: str,
@@ -1498,8 +1523,8 @@ def process(s: "Settings", ui_queue,
 
     # ── Build job list ───────────────────────────────────────────────────
     # Each job = (folder_path, FolderNode, output_dir)
-    # For per_root: one job per immediate subfolder (recursive content inside)
-    # For per_all:  one job per every folder that has content at any depth
+    # For per_root: ONE job for input_root as a full tree → single dat
+    # For per_all:  one job per every folder that has direct content at any depth
 
     jobs: List[Tuple[str, "FolderNode", str]] = []
 
@@ -1513,50 +1538,46 @@ def process(s: "Settings", ui_queue,
     root_folder_name = os.path.basename(input_root)
     root_out_base    = os.path.join(output_root, root_folder_name)
 
-    # ── Root-level items (files/zips sitting directly in input_root) ─────────
-    # These form one extra job representing the collection root itself.
-    root_items = []
-    for entry in top_entries:
-        if is_hidden_or_system(entry.path) or entry.is_symlink():
-            continue
-        if entry.is_file(follow_symlinks=False):
-            if is_mixed:
-                if not (ext_inc or ext_exc) or file_matches_filter(
-                        entry.name, ext_inc, ext_exc):
-                    root_items.append(entry.path)
-            elif entry.name.lower().endswith(".zip"):
-                root_items.append(entry.path)
-
-    if root_items:
-        root_items.sort(key=lambda p: os.path.basename(p).lower())
-        root_node = FolderNode(name=root_folder_name, relpath="")
-        root_node.items = root_items
-        jobs.append((input_root, root_node, root_out_base))
-
-    # ── Subfolders ───────────────────────────────────────────────────────────
-    for entry in top_entries:
-        if hard_stop.is_set():
-            break
-        if is_hidden_or_system(entry.path) or entry.is_symlink():
-            continue
-        if not entry.is_dir(follow_symlinks=False):
-            continue
-
-        folder_path = entry.path
-        folder_name = entry.name
-
-        if is_perroot:
-            if is_mixed:
-                node = scan_tree_mixed(folder_path, "", hard_stop, ui_queue,
+    if is_perroot:
+        # ── per_root: ONE job — scan the entire input_root tree → one dat ────
+        # This produces a single datfile named after input_root, with all
+        # subfolders represented as <dir> entries inside it (structure opt2+).
+        if is_mixed:
+            root_node = scan_tree_mixed(input_root, "", hard_stop, ui_queue,
                                         ext_inc, ext_exc)
-            else:
-                node = scan_tree_zipped(folder_path, "", hard_stop, ui_queue)
-            if count_items(node) == 0:
-                continue
-            out_dir = os.path.join(root_out_base, folder_name)
-            jobs.append((folder_path, node, out_dir))
         else:
-            # per_all: one dat per folder that has direct content
+            root_node = scan_tree_zipped(input_root, "", hard_stop, ui_queue)
+        if count_items(root_node) > 0:
+            jobs.append((input_root, root_node, root_out_base))
+    else:
+        # ── per_all: one dat per every folder that has direct content ─────────
+        # Root-level items (files/zips directly in input_root) → extra job
+        root_items = []
+        for entry in top_entries:
+            if is_hidden_or_system(entry.path) or entry.is_symlink():
+                continue
+            if entry.is_file(follow_symlinks=False):
+                if is_mixed:
+                    if not (ext_inc or ext_exc) or file_matches_filter(
+                            entry.name, ext_inc, ext_exc):
+                        root_items.append(entry.path)
+                elif entry.name.lower().endswith(".zip"):
+                    root_items.append(entry.path)
+        if root_items:
+            root_items.sort(key=lambda p: os.path.basename(p).lower())
+            root_node = FolderNode(name=root_folder_name, relpath="")
+            root_node.items = root_items
+            jobs.append((input_root, root_node, root_out_base))
+
+        # Subfolders: one shallow dat per folder that has direct content
+        for entry in top_entries:
+            if hard_stop.is_set():
+                break
+            if is_hidden_or_system(entry.path) or entry.is_symlink():
+                continue
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+
             def collect_perall_jobs(dir_path, rel_from_root):
                 if hard_stop.is_set():
                     return
@@ -1598,7 +1619,7 @@ def process(s: "Settings", ui_queue,
                         child_rel = os.path.join(rel_from_root, entry2.name)
                         collect_perall_jobs(entry2.path, child_rel)
 
-            collect_perall_jobs(folder_path, folder_name)
+            collect_perall_jobs(entry.path, entry.name)
 
     if hard_stop.is_set():
         ui_queue.put(("done", False, ["Hard stop during scan."],
@@ -1763,12 +1784,44 @@ def process(s: "Settings", ui_queue,
             work_fn = do_mixed if is_mixed else do_zipped
 
             def safe_work(item_path):
-                try:
-                    p, result, _, diag = work_fn(item_path)
-                    return p, result, None, diag
-                except Exception as exc:
-                    msg = str(exc)
-                    return item_path, None, ("CANCELLED" if "CANCELLED" in msg else repr(exc)), ""
+                """
+                Call work_fn with SMB transient-error retry + exponential backoff.
+                Sleeps in 1-second ticks so hard_stop is still responsive during waits.
+                After _SMB_RETRY_DELAYS exhausted, falls through to permanent error.
+                """
+                last_exc = None
+                max_attempts = len(_SMB_RETRY_DELAYS) + 1
+                for attempt in range(max_attempts):
+                    try:
+                        p, result, _, diag = work_fn(item_path)
+                        if attempt > 0:
+                            ui_queue.put(("status",
+                                "SMB retry succeeded on attempt "
+                                + str(attempt + 1) + ": "
+                                + os.path.basename(item_path)))
+                        return p, result, None, diag
+                    except Exception as exc:
+                        msg = str(exc)
+                        if "CANCELLED" in msg:
+                            return item_path, None, "CANCELLED", ""
+                        if attempt < len(_SMB_RETRY_DELAYS) and _is_smb_transient(exc):
+                            delay = _SMB_RETRY_DELAYS[attempt]
+                            last_exc = exc
+                            ui_queue.put(("status",
+                                "SMB timeout on "
+                                + os.path.basename(item_path)
+                                + " — waiting " + str(delay) + "s before retry "
+                                + str(attempt + 1) + "/"
+                                + str(len(_SMB_RETRY_DELAYS)) + " ..."))
+                            for _ in range(delay):
+                                if hard_stop.is_set():
+                                    return item_path, None, "CANCELLED", ""
+                                time.sleep(1)
+                            continue
+                        # Non-transient error, or retries exhausted
+                        return item_path, None, repr(exc), ""
+                # All retries exhausted
+                return item_path, None, repr(last_exc), ""
 
             # Helper: emit a subfolder header when parent dir changes
             _last_subdir = [None]
@@ -1857,9 +1910,10 @@ def process(s: "Settings", ui_queue,
         if len(dat_path) >= MAX_SAFE_PATH:
             errors.append(f"PATH LENGTH WARNING ({len(dat_path)}): {dat_path}")
 
-        # Both per_root and per_all use the same writers — per_all nodes are
-        # shallow (no subdirs) so the 5 structure options produce equivalent
-        # flat output. Per_root nodes are full trees and use the chosen structure.
+        # Both per_root and per_all use the same writers.
+        # per_root: one full-tree node for input_root → structure options apply.
+        # per_all: shallow nodes (no subdirs) → all structure options produce
+        #          equivalent flat output.
         write_perroot_dat(dat_path, node, data, dat_name, s, header_date, errors)
 
         if os.path.isfile(dat_path):
