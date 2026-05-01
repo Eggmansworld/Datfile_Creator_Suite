@@ -1,8 +1,20 @@
 # Eggman's Datfile Creator Suite
 
-A bulk datfile generation tool for **RomVault**, built for collectors who manage large, structured archives and need consistent, reproducible DAT files across hundreds or thousands of folders.
+Whether you're a casual collector who just wants RomVault to recognise your files, or a preservation veteran managing hundreds of thousands of ROMs across structured archives, this tool was built for you. Point it at a folder, hit Start, and get clean, consistent **Logiqx XML** datfiles — no scripting, no manual XML editing, no guesswork.
 
-Produces **Logiqx XML** datfiles compatible with RomVault, ClrMamePro, and RomCenter. Supports both **Mixed (Archive as File)** and **Zipped** collection types, with four structure options that replicate the datfile output styles that RomVault natively supports. Includes an incremental update engine for keeping existing datfiles current without rehashing unchanged content.
+Bulk-generates datfiles compatible with **RomVault, ClrMamePro, and RomCenter**. Supports both **Mixed (Archive as File)** and **Zipped** collection types across four structure options that mirror RomVault's own native output styles. An incremental update engine lets you rehash only what has changed, so revisiting a large collection doesn't mean starting from scratch. CRC32 and SHA1 are always included; MD5 and SHA256 are optional. ZStandard-compressed ZIPs are fully supported.
+
+### 🛠 Included Tools
+
+| Tool | What it does |
+|---|---|
+| **Folder Structure Analyzer** | Inspects your collection folders and recommends the right structure option before you run |
+| **Long Path Length Repair** | Identifies and allows you to interactively repair files and folders whose full path length approaches or exceeds the Windows 260-character `MAX_PATH` limit (requires data from Folder Structure Analyzer) |
+| **Bulk Datfile Header Updater** | Find and replace header fields (author, version, URL, etc.) across an entire folder of datfiles at once |
+| **Game and ROM Counter** | Tallies total games, ROMs, and collection size across any set of datfiles |
+| **Recursive Archive Extractor** | Extracts ZIP, 7Z, and RAR archives recursively through nested folder trees |
+| **ZIP Store Packer** | Repacks files into uncompressed ZIP_STORED archives — fast and RomVault-friendly |
+| **Remove ReadOnly Attribute** | Strips read-only flags and NTFS alternate data streams from files and folders in bulk |
 
 ---
 
@@ -21,7 +33,7 @@ If this tool saves you time, consider supporting the work:
 ## Table of Contents
 
 - [Requirements](#requirements)
-- [Installation](#installation)
+- [Installation](#python-installation)
 - [Quick Start](#quick-start)
 - [Interface Overview](#interface-overview)
   - [Paths](#paths)
