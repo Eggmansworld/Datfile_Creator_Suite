@@ -49,6 +49,7 @@ If this tool saves you time, consider supporting the work:
 - [Incremental Update — Skip Already-Hashed Files](#incremental-update--skip-already-hashed-files)
 - [Folder Structure Analyzer](#folder-structure-analyzer)
 - [Tools Menu](#tools-menu)
+  - [Long Path Length Repair](#long-path-length-repair)
   - [Bulk Datfile Header Updater](#bulk-datfile-header-updater)
   - [Game and ROM Counter](#game-and-rom-counter)
   - [Recursive Archive Extractor](#recursive-archive-extractor)
@@ -87,7 +88,7 @@ The app will display an error dialog and refuse to start if `zstandard` or `zipf
    pip install tkinterdnd2 zstandard zipfile-zstd psutil
    ```
 3. Download `Eggmans_Datfile_Creator_Suite.py` and place it anywhere convenient
-4. Optionally place `Eggmans_Datfile_Creator_banner.png` in the same folder for the About window banner
+4. Optionally place `Eggmans_Datfile_Creator_Suite_banner.png` in the same folder for the About window banner
 5. Run it:
    ```
    python Eggmans_Datfile_Creator_Suite.py
@@ -608,6 +609,8 @@ After validation completes, the **💾 Save Pre-inspection Log** button becomes 
 
 **Zipped mode:** Each zip is checked against the dat using filename + uncompressed size + CRC32 (read from the zip central directory — no decompression needed, takes milliseconds). If all three match, the existing SHA1, MD5, and SHA-256 values are carried forward directly from the dat. Only new or changed zips are fully analyzed.
 
+The validator also correctly handles **nested zip structures** (Structure 3/4 dats where zip files live inside first-level subfolders). The `<dir>` container entries in the dat are matched against physical subfolders, and the leaf `<game>` zip entries are searched both in the root folder and one level deep inside subfolders. A dat with 69 folder entries and 73 zip entries will correctly report 142/142 match rather than falsely reporting 0%.
+
 **Mixed mode:** Files are matched by filename + size only. If both match, existing hash data is carried forward. This applies to all files across all game subfolders — every rom in every game is indexed, not just the first file per game. If a file was replaced with content of the same name and the same size, the change cannot be detected without a full rehash — see the warning in the Pre-flight Check dialog.
 
 **Folder-based Mixed collections** (Structure 3/4 where each game is a subfolder containing multiple files): The incremental engine indexes every rom across every game subfolder. A game is considered fully matched only if its subfolder exists AND every listed rom file is present within it. Individual missing files within a present game folder are reported separately from whole games that are absent.
@@ -647,12 +650,31 @@ The Analyzer walks the folder structure in a background thread (no hashing, comp
 - Pattern breakdown — flat game folders, container folders, folders with nested subdirs
 - Sample folder names for spot-checking
 - **Recommendation** — a suggested Generation mode and Structure option, colour-coded by confidence level (green = high, amber = medium)
+- **Path length statistics** — count of files approaching or exceeding the Windows 260-character `MAX_PATH` limit, with a direct **Open in Long Path Repair** button
 
 Clicking **Apply Recommended Settings** fills the main window's Dat Type, Generation, Structure, Format, and Input folder fields automatically and closes the Analyzer.
 
 ---
 
 ## Tools Menu
+
+### Long Path Length Repair
+
+Available via **Tools → Long Path Length Repair...** (also launchable directly from the Folder Structure Analyzer with current scan results pre-loaded).
+
+Identifies files and folders whose full path length approaches or exceeds the Windows 260-character `MAX_PATH` limit, and allows you to rename them interactively to bring them under threshold. Particularly useful before a dat run when long paths would cause hashing or extraction failures.
+
+**Features:**
+- Treeview lists every flagged file with its current path length, severity, and rename status
+- **Filter bar** — switch between All / Warning (≥200 chars) / Critical (≥240 chars) / Pending views
+- **Edit panel** — full path shown colour-coded (directory in blue, stem editable in white, extension in grey), with a live character counter that updates as you type
+- **Rename flow:** select → edit stem → press Enter to preview → Apply Selected or Apply All to commit
+- **Undo Last** — reverses the most recent rename
+- **Save Rename Log** — exports the full rename history to a text file
+- **Import from Log** — reload a previously saved analysis to resume work across sessions
+- Can be launched standalone (browse to any folder) or pre-loaded from the Analyzer (no second scan required)
+
+---
 
 ### Bulk Datfile Header Updater
 
@@ -852,6 +874,10 @@ Attribute order follows the RomVault DATReader source (`DatXMLWriter.cs`):
 
 `sha256` and `md5` are only written when their respective checkboxes are enabled. `date` is only written when **File date & time** is enabled (Zipped mode only).
 
+### CP437 Graphical Characters in Filenames
+
+ZIP archives with filenames containing DOS CP437 graphical characters (bytes `0x01–0x1F` — card suits ♥ ♦ ♣ ♠, smileys ☺ ☻, arrows ↑ ↓ → ←, and similar) are handled correctly. Python's `cp437` codec misreads these bytes as Unicode control characters, which are illegal in XML 1.0. The tool translates them to their correct graphical Unicode equivalents — exactly as RomVault's own `CodePage437.cs` does — before writing any XML. The result is a valid dat that RomVault can read and that preserves the original filename symbols faithfully.
+
 ### `<game>` vs `<dir>` in RomVault
 
 In RomVault's internal model (from `RVWorld` source):
@@ -871,6 +897,7 @@ This distinction matters for RomVault's Fix engine: only `<game>` entries can be
 - **Incremental update Mixed mode cannot detect same-name same-size file replacements.** If a file has been replaced with content of identical filename and size, the change will not be detected. The Pre-flight Check dialog warns of this when Mixed mode is active. A full rehash option is available in the dialog for this scenario.
 - **Per All mode with very large collections may be slow during Phase 1.** The scanner must traverse every folder at every depth. The progress window shows a live spinner and logs each folder as it is discovered, so you can see that the scan is still running.
 - **Heavily compressed Unity game archives (.resS resource streaming files)** with extreme compression ratios (e.g. 10 GB uncompressed in a 514 MB zip) will be slower than other archives regardless of network speed. The bottleneck is CPU decompression time, not network throughput. These entries are identified by name in the activity log.
+- **Windows only.** The tool uses `winsound`, PowerShell, and NTFS-specific concepts. It will not run on Linux or macOS.
 
 ---
 
