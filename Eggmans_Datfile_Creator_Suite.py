@@ -32,7 +32,7 @@ RomVault DAT format (from RVWorld DATReader source):
   - forcepacking absent on Zipped header → RomVault defaults to Zip mode
 """
 
-import os, sys, json, re, time, queue, zlib, stat, io, gc
+import os, sys, json, re, time, queue, zlib, stat, io, gc, subprocess
 import ctypes, hashlib, threading, datetime
 from concurrent.futures import (ThreadPoolExecutor, as_completed,
                                 wait as _cf_wait, FIRST_COMPLETED)
@@ -96,28 +96,6 @@ STREAM_OPEN_BUF   =   4 * 1024 * 1024  # 4 MB  (stream path only)
 STREAM_ENTRY_MEM  =  64 * 1024 * 1024  # 64 MB max compressed bytes held in RAM per entry
 _LARGE_ZIP_LOCK   = threading.Semaphore(1)
 
-# ── SMB transient-error retry ────────────────────────────────────────────────
-# On Windows, a mid-read SMB disconnect surfaces as [Errno 22] Invalid argument
-# (ERROR_INVALID_PARAMETER) because the file handle goes stale.  Other common
-# codes: 121 = ERROR_SEM_TIMEOUT, 1236 = ERROR_CONNECTION_ABORTED,
-# 10054/10060 = Winsock connection reset / timed out.
-# Retry delays (seconds): 10 → 20 → 40 → 80 → 160  (5 attempts, then give up)
-_SMB_RETRY_DELAYS    = (10, 20, 40, 80, 160)
-_SMB_TRANSIENT_ERRNO = frozenset({22, 121, 1236})
-_SMB_TRANSIENT_WERR  = frozenset({121, 1236, 10054, 10060})
-_SMB_TRANSIENT_MSG   = ("invalid argument", "connection reset",
-                         "timed out", "connection aborted",
-                         "winerror 121", "winerror 1236")
-
-def _is_smb_transient(exc: Exception) -> bool:
-    """Return True if exc looks like a recoverable SMB/network hiccup."""
-    if getattr(exc, "errno",    None) in _SMB_TRANSIENT_ERRNO:
-        return True
-    if getattr(exc, "winerror", None) in _SMB_TRANSIENT_WERR:
-        return True
-    msg = str(exc).lower()
-    return any(pat in msg for pat in _SMB_TRANSIENT_MSG)
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  UTILITIES
@@ -140,9 +118,58 @@ def is_hidden_or_system(path: str) -> bool:
         return False
 
 
+# Python's cp437 codec decodes ZIP-internal filename bytes 0x01-0x1F as Unicode
+# control characters U+0001-U+001F, which are illegal in XML 1.0.
+# RomVault's own CP437 table (CodePage437.cs) maps those same bytes to graphical
+# Unicode symbols in the U+2000+ range — all valid XML.  We translate using
+# RomVault's exact table so dat output matches RomVault's own interpretation.
+# U+0009/000A/000D (tab/LF/CR) are legal XML and left as-is.
+# U+0000 and U+FFFE/FFFF are stripped (genuinely unrepresentable in XML 1.0).
+_CP437_CTRL_TO_GLYPH: dict = {
+    '\x01': '\u263a',  # ☺
+    '\x02': '\u263b',  # ☻
+    '\x03': '\u2665',  # ♥
+    '\x04': '\u2666',  # ♦
+    '\x05': '\u2663',  # ♣
+    '\x06': '\u2660',  # ♠
+    '\x07': '\u2022',  # •
+    '\x08': '\u25d8',  # ◘
+    '\x0b': '\u2642',  # ♂
+    '\x0c': '\u2640',  # ♀
+    '\x0e': '\u266b',  # ♫
+    '\x0f': '\u263c',  # ☼
+    '\x10': '\u25ba',  # ►
+    '\x11': '\u25c4',  # ◄
+    '\x12': '\u2195',  # ↕
+    '\x13': '\u203c',  # ‼
+    '\x14': '\u00b6',  # ¶
+    '\x15': '\u00a7',  # §
+    '\x16': '\u25ac',  # ▬
+    '\x17': '\u21a8',  # ↨
+    '\x18': '\u2191',  # ↑
+    '\x19': '\u2193',  # ↓
+    '\x1a': '\u2192',  # →
+    '\x1b': '\u2190',  # ←
+    '\x1c': '\u221f',  # ∟
+    '\x1d': '\u2194',  # ↔
+    '\x1e': '\u25b2',  # ▲
+    '\x1f': '\u25bc',  # ▼
+}
+_CP437_TRANS = str.maketrans(_CP437_CTRL_TO_GLYPH)
+_XML_UNREPRESENTABLE_RE = re.compile(r'[\x00\ufffe\uffff]')
+
+def _fix_xml_chars(s: str) -> str:
+    """Translate CP437 control chars to their RomVault graphical equivalents,
+    then strip the handful of code points that have no valid XML 1.0 form."""
+    return _XML_UNREPRESENTABLE_RE.sub('', s.translate(_CP437_TRANS))
+
 def xa(value: str) -> str:
-    """Escape for XML attribute values."""
-    return xml_escape(value, {'"': "&quot;", "'": "&apos;"})
+    """Escape for XML attribute values, fixing CP437/XML char issues first."""
+    return xml_escape(_fix_xml_chars(value), {'"': "&quot;", "'": "&apos;"})
+
+def xe(value: str) -> str:
+    """Escape for XML element content, fixing CP437/XML char issues first."""
+    return xml_escape(_fix_xml_chars(value))
 
 
 def script_dir() -> str:
@@ -1165,7 +1192,7 @@ def _write_game_open(f, name: str, s: "Settings", depth: int) -> str:
     tag = _gtag(s)
     f.write(f'{t}<{tag} name="{xa(name)}">\n')
     if tag != "dir" and s.incl_game_desc:
-        f.write(f'{ti}<description>{xml_escape(name)}</description>\n')
+        f.write(f'{ti}<description>{xe(name)}</description>\n')
     return tag
 
 
@@ -1202,7 +1229,7 @@ def _z_block(f, zip_path: str, data: dict, s: "Settings",
     tag  = _gtag(s) if as_game else "dir"
     f.write(f'{t}<{tag} name="{xa(name)}">\n')
     if tag != "dir" and s.incl_game_desc:
-        f.write(f'{ti}<description>{xml_escape(name)}</description>\n')
+        f.write(f'{ti}<description>{xe(name)}</description>\n')
     for (rn, sz, crc, sha1, md5, sha256, ds) in data.get(zip_path, []):
         f.write(f"{ti}{rom_line(rn, sz, crc, sha1, md5, sha256, ds, s.include_md5, s.include_sha256, s.incl_file_date)}\n")
     f.write(f'{t}</{tag}>\n')
@@ -1445,16 +1472,13 @@ def make_dat_name(folder_name: str, input_root: str, s: "Settings") -> str:
     Always includes the top-level input folder name between parent and subfolder.
     e.g. parent="Commodore", root="C16-C116-Plus4", folder="[ARK]"
          -> "Commodore - C16-C116-Plus4 - [ARK]"
-    When folder_name == root_name (i.e. the job IS the root), the folder name
-    is not appended — avoids "Mixed - Sir-Tech - Sir-Tech" duplication.
     """
     root_name = os.path.basename(os.path.normpath(input_root))
     parts = []
     if s.parent_name.strip():
         parts.append(s.parent_name.strip())
     parts.append(root_name)
-    if folder_name != root_name:
-        parts.append(folder_name)
+    parts.append(folder_name)
     return " - ".join(parts)
 
 def make_dat_filename(dat_name: str, header_date: str,
@@ -1523,8 +1547,8 @@ def process(s: "Settings", ui_queue,
 
     # ── Build job list ───────────────────────────────────────────────────
     # Each job = (folder_path, FolderNode, output_dir)
-    # For per_root: ONE job for input_root as a full tree → single dat
-    # For per_all:  one job per every folder that has direct content at any depth
+    # For per_root: one job per immediate subfolder (recursive content inside)
+    # For per_all:  one job per every folder that has content at any depth
 
     jobs: List[Tuple[str, "FolderNode", str]] = []
 
@@ -1538,46 +1562,50 @@ def process(s: "Settings", ui_queue,
     root_folder_name = os.path.basename(input_root)
     root_out_base    = os.path.join(output_root, root_folder_name)
 
-    if is_perroot:
-        # ── per_root: ONE job — scan the entire input_root tree → one dat ────
-        # This produces a single datfile named after input_root, with all
-        # subfolders represented as <dir> entries inside it (structure opt2+).
-        if is_mixed:
-            root_node = scan_tree_mixed(input_root, "", hard_stop, ui_queue,
-                                        ext_inc, ext_exc)
-        else:
-            root_node = scan_tree_zipped(input_root, "", hard_stop, ui_queue)
-        if count_items(root_node) > 0:
-            jobs.append((input_root, root_node, root_out_base))
-    else:
-        # ── per_all: one dat per every folder that has direct content ─────────
-        # Root-level items (files/zips directly in input_root) → extra job
-        root_items = []
-        for entry in top_entries:
-            if is_hidden_or_system(entry.path) or entry.is_symlink():
-                continue
-            if entry.is_file(follow_symlinks=False):
-                if is_mixed:
-                    if not (ext_inc or ext_exc) or file_matches_filter(
-                            entry.name, ext_inc, ext_exc):
-                        root_items.append(entry.path)
-                elif entry.name.lower().endswith(".zip"):
+    # ── Root-level items (files/zips sitting directly in input_root) ─────────
+    # These form one extra job representing the collection root itself.
+    root_items = []
+    for entry in top_entries:
+        if is_hidden_or_system(entry.path) or entry.is_symlink():
+            continue
+        if entry.is_file(follow_symlinks=False):
+            if is_mixed:
+                if not (ext_inc or ext_exc) or file_matches_filter(
+                        entry.name, ext_inc, ext_exc):
                     root_items.append(entry.path)
-        if root_items:
-            root_items.sort(key=lambda p: os.path.basename(p).lower())
-            root_node = FolderNode(name=root_folder_name, relpath="")
-            root_node.items = root_items
-            jobs.append((input_root, root_node, root_out_base))
+            elif entry.name.lower().endswith(".zip"):
+                root_items.append(entry.path)
 
-        # Subfolders: one shallow dat per folder that has direct content
-        for entry in top_entries:
-            if hard_stop.is_set():
-                break
-            if is_hidden_or_system(entry.path) or entry.is_symlink():
-                continue
-            if not entry.is_dir(follow_symlinks=False):
-                continue
+    if root_items:
+        root_items.sort(key=lambda p: os.path.basename(p).lower())
+        root_node = FolderNode(name=root_folder_name, relpath="")
+        root_node.items = root_items
+        jobs.append((input_root, root_node, root_out_base))
 
+    # ── Subfolders ───────────────────────────────────────────────────────────
+    for entry in top_entries:
+        if hard_stop.is_set():
+            break
+        if is_hidden_or_system(entry.path) or entry.is_symlink():
+            continue
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+
+        folder_path = entry.path
+        folder_name = entry.name
+
+        if is_perroot:
+            if is_mixed:
+                node = scan_tree_mixed(folder_path, "", hard_stop, ui_queue,
+                                        ext_inc, ext_exc)
+            else:
+                node = scan_tree_zipped(folder_path, "", hard_stop, ui_queue)
+            if count_items(node) == 0:
+                continue
+            out_dir = os.path.join(root_out_base, folder_name)
+            jobs.append((folder_path, node, out_dir))
+        else:
+            # per_all: one dat per folder that has direct content
             def collect_perall_jobs(dir_path, rel_from_root):
                 if hard_stop.is_set():
                     return
@@ -1619,7 +1647,7 @@ def process(s: "Settings", ui_queue,
                         child_rel = os.path.join(rel_from_root, entry2.name)
                         collect_perall_jobs(entry2.path, child_rel)
 
-            collect_perall_jobs(entry.path, entry.name)
+            collect_perall_jobs(folder_path, folder_name)
 
     if hard_stop.is_set():
         ui_queue.put(("done", False, ["Hard stop during scan."],
@@ -1784,44 +1812,12 @@ def process(s: "Settings", ui_queue,
             work_fn = do_mixed if is_mixed else do_zipped
 
             def safe_work(item_path):
-                """
-                Call work_fn with SMB transient-error retry + exponential backoff.
-                Sleeps in 1-second ticks so hard_stop is still responsive during waits.
-                After _SMB_RETRY_DELAYS exhausted, falls through to permanent error.
-                """
-                last_exc = None
-                max_attempts = len(_SMB_RETRY_DELAYS) + 1
-                for attempt in range(max_attempts):
-                    try:
-                        p, result, _, diag = work_fn(item_path)
-                        if attempt > 0:
-                            ui_queue.put(("status",
-                                "SMB retry succeeded on attempt "
-                                + str(attempt + 1) + ": "
-                                + os.path.basename(item_path)))
-                        return p, result, None, diag
-                    except Exception as exc:
-                        msg = str(exc)
-                        if "CANCELLED" in msg:
-                            return item_path, None, "CANCELLED", ""
-                        if attempt < len(_SMB_RETRY_DELAYS) and _is_smb_transient(exc):
-                            delay = _SMB_RETRY_DELAYS[attempt]
-                            last_exc = exc
-                            ui_queue.put(("status",
-                                "SMB timeout on "
-                                + os.path.basename(item_path)
-                                + " — waiting " + str(delay) + "s before retry "
-                                + str(attempt + 1) + "/"
-                                + str(len(_SMB_RETRY_DELAYS)) + " ..."))
-                            for _ in range(delay):
-                                if hard_stop.is_set():
-                                    return item_path, None, "CANCELLED", ""
-                                time.sleep(1)
-                            continue
-                        # Non-transient error, or retries exhausted
-                        return item_path, None, repr(exc), ""
-                # All retries exhausted
-                return item_path, None, repr(last_exc), ""
+                try:
+                    p, result, _, diag = work_fn(item_path)
+                    return p, result, None, diag
+                except Exception as exc:
+                    msg = str(exc)
+                    return item_path, None, ("CANCELLED" if "CANCELLED" in msg else repr(exc)), ""
 
             # Helper: emit a subfolder header when parent dir changes
             _last_subdir = [None]
@@ -1910,10 +1906,9 @@ def process(s: "Settings", ui_queue,
         if len(dat_path) >= MAX_SAFE_PATH:
             errors.append(f"PATH LENGTH WARNING ({len(dat_path)}): {dat_path}")
 
-        # Both per_root and per_all use the same writers.
-        # per_root: one full-tree node for input_root → structure options apply.
-        # per_all: shallow nodes (no subdirs) → all structure options produce
-        #          equivalent flat output.
+        # Both per_root and per_all use the same writers — per_all nodes are
+        # shallow (no subdirs) so the 5 structure options produce equivalent
+        # flat output. Per_root nodes are full trees and use the chosen structure.
         write_perroot_dat(dat_path, node, data, dat_name, s, header_date, errors)
 
         if os.path.isfile(dat_path):
@@ -2141,6 +2136,9 @@ class App:
         tools_menu.add_command(
             label="Analyze Folder Structure...",
             command=self.open_analyzer)
+        tools_menu.add_command(
+            label="Long Path Length Repair...",
+            command=self.open_long_path_repair)
         tools_menu.add_separator()
         tools_menu.add_command(
             label="Bulk Datfile Header Updater...",
@@ -2177,6 +2175,9 @@ class App:
 
     def open_analyzer(self):
         AnalyzerWindow(self.root, self)
+
+    def open_long_path_repair(self):
+        LongPathRepairWindow(self.root, self)
 
     def open_bulk_header_updater(self):
         BulkHeaderUpdaterWindow(self.root, self)
@@ -3400,16 +3401,42 @@ def validate_dat_vs_folder(game_index: dict, folder_path: str,
     missing:        list = []
     seen_dat_files: set  = set()
 
+    # Pre-scan one level of subfolders for zips.  This handles the nested
+    # <dir>/<game> structure (Structure opt3/opt4 in Zipped mode) where zip
+    # files live inside first-level subfolders rather than directly in the
+    # folder being validated.  O(total nested files) once, O(1) per lookup.
+    _nested_zip_files: set = set()
+    if is_zipped:
+        for subdir in folder_subdirs:
+            sub_path = os.path.join(folder_path, subdir)
+            try:
+                for e in os.scandir(sub_path):
+                    if e.is_file(follow_symlinks=False) and e.name.lower().endswith(".zip"):
+                        _nested_zip_files.add(e.name)
+            except Exception:
+                pass
+
     for gname, gdata in game_index.items():
         roms = gdata.get("roms", [])
 
         if is_zipped:
-            expected = gname + ".zip"
-            seen_dat_files.add(expected)
-            if expected in folder_files:
-                matched.add(expected)
+            if not roms:
+                # <dir> container entry — the dat has a folder wrapper, not a zip.
+                # Check that the corresponding subfolder exists on disk.
+                seen_dat_files.add(gname)          # register without .zip suffix
+                if gname in folder_subdirs:
+                    matched.add(gname)
+                else:
+                    missing.append(gname)
             else:
-                missing.append(gname)
+                # Leaf zip entry — check top-level folder first, then one level deep
+                # inside subfolders (covers nested <dir>/<game> structure).
+                expected = gname + ".zip"
+                seen_dat_files.add(expected)
+                if expected in folder_files or expected in _nested_zip_files:
+                    matched.add(expected)
+                else:
+                    missing.append(gname)
         else:
             # Mixed — two layouts:
             # A) Folder-based (Structure 3/4): game_name = subfolder,
@@ -4380,14 +4407,105 @@ def _make_recommendation(findings):
     return findings
 
 
+def _collect_path_lengths(root_path, cancel_flag=None):
+    """
+    Walk every path (dirs and files) under root_path and collect
+    path-length statistics.
+
+    Thresholds:
+      WARN_LIMIT = 200 chars  — [Warning]  (best-practice ceiling for dat authors)
+      CRIT_LIMIT = 260 chars  — [Critical] (Windows MAX_PATH hard limit)
+
+    Returns a dict:
+      total_paths : int   — total paths counted
+      max_path_len: int   — length of the single longest path seen
+      longest_path: str   — the actual longest path string
+      warn_count  : int   — paths 200 <= len < 260
+      crit_count  : int   — paths >= 260
+      warn_paths  : list  — [(len, path), ...] sorted descending, 200-259 chars
+      crit_paths  : list  — [(len, path), ...] sorted descending, 260+ chars
+    """
+    WARN_LIMIT = 200
+    CRIT_LIMIT = 260
+
+    max_len      = 0
+    longest_path = ""
+    warn_paths   = []
+    crit_paths   = []
+    total_paths  = 0
+
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        if cancel_flag and cancel_flag.is_set():
+            break
+
+        # Skip hidden/dot directories from traversal
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+
+        # Check the directory path itself
+        plen = len(dirpath)
+        total_paths += 1
+        if plen > max_len:
+            max_len      = plen
+            longest_path = dirpath
+        if plen >= CRIT_LIMIT:
+            crit_paths.append((plen, dirpath))
+        elif plen >= WARN_LIMIT:
+            warn_paths.append((plen, dirpath))
+
+        # Check every file path in this directory
+        for fname in filenames:
+            fpath = os.path.join(dirpath, fname)
+            plen  = len(fpath)
+            total_paths += 1
+            if plen > max_len:
+                max_len      = plen
+                longest_path = fpath
+            if plen >= CRIT_LIMIT:
+                crit_paths.append((plen, fpath))
+            elif plen >= WARN_LIMIT:
+                warn_paths.append((plen, fpath))
+
+    warn_paths.sort(key=lambda x: x[0], reverse=True)
+    crit_paths.sort(key=lambda x: x[0], reverse=True)
+
+    return {
+        "total_paths": total_paths,
+        "max_path_len": max_len,
+        "longest_path": longest_path,
+        "warn_count":   len(warn_paths),
+        "crit_count":   len(crit_paths),
+        "warn_paths":   warn_paths,
+        "crit_paths":   crit_paths,
+    }
+
+
+# Known multi-part extensions for the path repair tool.
+# os.path.splitext only strips the last component (.png from .p8.png),
+# so we check these first to keep the full suffix intact.
+_MULTI_EXT = {
+    ".p8.png", ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst",
+}
+
+def _split_stem_ext(filename):
+    """
+    Split filename into (stem, ext), handling known multi-part extensions.
+    Returns ("stem", ".ext") where ext may be a compound like ".p8.png".
+    """
+    fl = filename.lower()
+    for me in _MULTI_EXT:
+        if fl.endswith(me):
+            return filename[: -len(me)], filename[-len(me):]
+    return os.path.splitext(filename)
+
+
 class AnalyzerWindow(tk.Toplevel):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app      = app
         self._result  = None
         self.title("Folder Structure Analyzer")
-        self.geometry("740x580")
-        self.minsize(640, 460)
+        self.geometry("820x640")
+        self.minsize(700, 500)
         self.configure(bg=app._c["options"])
         self._c = app._c
         self._build_ui()
@@ -4449,18 +4567,22 @@ class AnalyzerWindow(tk.Toplevel):
         box = tk.Frame(res, bg=ENT, highlightbackground=c["sep"],
                        highlightthickness=1)
         box.pack(fill="both", expand=True)
-        self.txt = tk.Text(box, height=12, wrap="word", bg=ENT, fg=FG,
+        self.txt = tk.Text(box, height=12, wrap="none", bg=ENT, fg=FG,
                            insertbackground=FG, relief="flat", bd=0,
-                           padx=6, pady=6, font=("Segoe UI", 9),
+                           padx=6, pady=6, font=("Consolas", 9),
                            state="disabled")
         sb = ttk.Scrollbar(box, command=self.txt.yview)
         self.txt.configure(yscrollcommand=sb.set)
+        sb_x = ttk.Scrollbar(box, orient="horizontal", command=self.txt.xview)
+        self.txt.configure(xscrollcommand=sb_x.set)
         sb.pack(side="right", fill="y")
+        sb_x.pack(side="bottom", fill="x")
         self.txt.pack(fill="both", expand=True)
 
         self.txt.tag_configure("h",    font=("Segoe UI", 9, "bold"), foreground="#1A4A7A")
         self.txt.tag_configure("good", foreground="#1A6A2A")
         self.txt.tag_configure("warn", foreground="#8A5A00")
+        self.txt.tag_configure("crit", font=("Consolas", 9, "bold"), foreground="#CC0000")
         self.txt.tag_configure("stat", font=("Consolas", 9), foreground="#3A3A3A")
         self.txt.tag_configure("rech", font=("Segoe UI", 9, "bold"),
                                foreground="#1A5A1A", background="#D6EDD6")
@@ -4482,6 +4604,16 @@ class AnalyzerWindow(tk.Toplevel):
 
         bot = tk.Frame(self, bg=BG, padx=pad, pady=6)
         bot.pack(fill="x")
+        self.btn_save_log = ttk.Button(bot, text="\U0001f4be  Save Analysis Log",
+                                       style="Save.TButton",
+                                       command=self._save_analysis_log,
+                                       state="disabled")
+        self.btn_save_log.pack(side="left")
+        self.btn_repair = ttk.Button(bot, text="\U0001f527  Open Path Repair Tool",
+                                     style="SoftStop.TButton",
+                                     command=self._open_repair_tool,
+                                     state="disabled")
+        self.btn_repair.pack(side="left", padx=(8, 0))
         ttk.Button(bot, text="Close", style="Browse.TButton",
                    command=self.destroy).pack(side="right")
 
@@ -4541,6 +4673,11 @@ class AnalyzerWindow(tk.Toplevel):
                     p, dtype,
                     progress_cb=progress_cb,
                     cancel_flag=self._cancel_flag)
+                if not (self._cancel_flag and self._cancel_flag.is_set()):
+                    self.after(0, lambda: self._wt(
+                        "\nScanning path lengths — please wait...\n"))
+                    path_stats = _collect_path_lengths(p, self._cancel_flag)
+                    result["path_stats"] = path_stats
                 self.after(0, lambda r=result: self._on_scan_done(r))
             except Exception as exc:
                 import traceback
@@ -4555,8 +4692,20 @@ class AnalyzerWindow(tk.Toplevel):
         self._result = result
         self.btn_analyze.configure(state="normal")
         self.btn_analyze_stop.configure(state="disabled")
+        ps = result.get("path_stats")
+        if ps is not None:
+            self.btn_save_log.configure(state="normal")
+            if ps["warn_count"] > 0 or ps["crit_count"] > 0:
+                self.btn_repair.configure(state="normal")
+            else:
+                self.btn_repair.configure(state="disabled")
         self._wt("\nScan complete.\n\n", "h")
         self._display(result)
+
+    def _open_repair_tool(self):
+        """Open the Long Path Repair tool pre-loaded with current scan results."""
+        ps = self._result.get("path_stats") if self._result else None
+        LongPathRepairWindow(self.app.root, self.app, path_stats=ps)
 
     def _on_scan_error(self, tb):
         """Called on main thread when scan raises."""
@@ -4625,6 +4774,61 @@ class AnalyzerWindow(tk.Toplevel):
             for note in r["notes"]:
                 self._wt("  " + note + "\n\n", "warn")
 
+        # ── Path Length Analysis ──────────────────────────────────────────────
+        ps = r.get("path_stats")
+        if ps is not None:
+            self._wt("\nPATH LENGTH ANALYSIS\n", "h")
+            self._wt(
+                "  Thresholds  : >=200 chars = [Warning]   >=260 chars = [Critical]\n"
+                "  Total paths : " + str(ps["total_paths"]) + "\n"
+                "  Max length  : " + str(ps["max_path_len"]) + " chars\n", "stat")
+
+            if ps["crit_count"] > 0:
+                self._wt(
+                    "  >= 260 chars: " + str(ps["crit_count"]).rjust(5)
+                    + "  [CRITICAL] — exceed Windows MAX_PATH\n", "crit")
+            else:
+                self._wt(
+                    "  >= 260 chars: " + "0".rjust(5)
+                    + "  (none — below critical threshold)\n", "good")
+
+            if ps["warn_count"] > 0:
+                self._wt(
+                    "  >= 200 chars: " + str(ps["warn_count"]).rjust(5)
+                    + "  [Warning]  — review for dat compatibility\n", "warn")
+            else:
+                self._wt(
+                    "  >= 200 chars: " + "0".rjust(5)
+                    + "  (none — all paths within safe range)\n", "good")
+
+            # Show top offenders (up to 10, criticals first)
+            top = sorted(ps["crit_paths"] + ps["warn_paths"],
+                         key=lambda x: x[0], reverse=True)[:10]
+            if top:
+                self._wt("\n  Top longest paths:\n", "stat")
+                for plen, pstr in top:
+                    if plen >= 260:
+                        label = "[Critical] (" + str(plen) + " chars)  "
+                        tag   = "crit"
+                    else:
+                        label = "[Warning]  (" + str(plen) + " chars)  "
+                        tag   = "warn"
+                    self._wt("    " + label + pstr + "\n", tag)
+
+            if ps["warn_count"] > 0 or ps["crit_count"] > 0:
+                total_issues = ps["warn_count"] + ps["crit_count"]
+                shown        = min(10, total_issues)
+                if total_issues > shown:
+                    self._wt(
+                        "\n  (" + str(total_issues - shown)
+                        + " more — use Save Analysis Log to see all)\n", "warn")
+                else:
+                    self._wt(
+                        "\n  Use \"\U0001f4be Save Analysis Log\" to export the full path list.\n",
+                        "warn")
+            else:
+                self._wt("\n  No path length issues found.\n", "good")
+
         if rec and rec.get("confidence") != "none":
             self._wt("\nRECOMMENDATION\n", "h")
             conf_tag = "rech" if rec["confidence"] == "high" else "recm"
@@ -4638,6 +4842,129 @@ class AnalyzerWindow(tk.Toplevel):
             self.btn_apply.configure(state="disabled")
 
         self.txt.yview_moveto(0.0)
+
+    def _save_analysis_log(self):
+        """Save structure analysis + path length findings to a text log file."""
+        r = self._result
+        if not r:
+            return
+        ps = r.get("path_stats")
+
+        default_name = ("analysis_" +
+                        datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".txt")
+        out_path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Save Analysis Log",
+            defaultextension=".txt",
+            initialfile=default_name,
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if not out_path:
+            return
+
+        lines = []
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sep = "=" * 72
+
+        lines += [
+            "Eggman's Datfile Creator Suite — Folder Structure & Path Length Analysis",
+            "Generated  : " + now,
+            "Root path  : " + r["root_path"],
+            "Type       : " + ("Zipped (zip contents)"
+                               if r["dat_type"] == "zipped"
+                               else "Mixed (Archive as File)"),
+            "",
+        ]
+
+        # ── Structure summary ────────────────────────────────────────────────
+        cw = "zip archives" if r["dat_type"] == "zipped" else "files"
+        lines += [
+            sep,
+            "FOLDER STRUCTURE STATISTICS",
+            sep,
+            "  Top-level folders   : " + str(r["top_folders"]),
+            "  Total " + cw.ljust(14) + ": " + str(r["total_items"]),
+            "  Max folder depth    : " + str(r["max_depth"]),
+            "",
+        ]
+        if r.get("depth_histogram"):
+            lines.append("  Depth distribution:")
+            label_map = {1: "flat (items only)", 2: "one subdir level",
+                         3: "two levels deep",  4: "three levels deep"}
+            for d in sorted(r["depth_histogram"]):
+                cnt = r["depth_histogram"][d]
+                lbl = label_map.get(d, str(d) + " levels deep")
+                lines.append("    depth " + str(d) + "  " + lbl.ljust(22)
+                             + str(cnt).rjust(4) + " folder(s)")
+            lines.append("")
+
+        rec = r.get("recommendation", {})
+        if rec and rec.get("confidence") != "none":
+            lines += [
+                "RECOMMENDATION : " + rec.get("summary", ""),
+            ]
+            for detail in rec.get("detail", []):
+                lines.append("  " + detail)
+            lines.append("")
+
+        if r.get("notes"):
+            lines.append("NOTES:")
+            for note in r["notes"]:
+                lines.append("  " + note)
+            lines.append("")
+
+        # ── Path length analysis ─────────────────────────────────────────────
+        if ps is not None:
+            lines += [
+                sep,
+                "PATH LENGTH ANALYSIS",
+                sep,
+                "  Thresholds  : >=200 chars = [Warning]   >=260 chars = [Critical]",
+                "  Total paths : " + str(ps["total_paths"]),
+                "  Max length  : " + str(ps["max_path_len"]) + " chars",
+                "  >= 200 chars: " + str(ps["warn_count"]) + "  [Warning]",
+                "  >= 260 chars: " + str(ps["crit_count"]) + "  [Critical]",
+                "",
+            ]
+
+            if ps["warn_count"] == 0 and ps["crit_count"] == 0:
+                lines += [
+                    "  All paths are within the 200-character safe threshold. No issues found.",
+                    "",
+                ]
+            else:
+                # Critical paths first
+                if ps["crit_paths"]:
+                    lines += [
+                        "-" * 72,
+                        "[Critical] — Paths >= 260 characters  ("
+                        + str(len(ps["crit_paths"])) + " found)",
+                        "-" * 72,
+                    ]
+                    for plen, pstr in ps["crit_paths"]:
+                        lines.append("[Critical] (" + str(plen) + " chars)  " + pstr)
+                    lines.append("")
+
+                # Warning paths
+                if ps["warn_paths"]:
+                    lines += [
+                        "-" * 72,
+                        "[Warning]  — Paths 200–259 characters  ("
+                        + str(len(ps["warn_paths"])) + " found)",
+                        "-" * 72,
+                    ]
+                    for plen, pstr in ps["warn_paths"]:
+                        lines.append("[Warning]  (" + str(plen) + " chars)  " + pstr)
+                    lines.append("")
+
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            messagebox.showinfo(
+                "Log Saved",
+                "Analysis log saved to:\n" + out_path,
+                parent=self)
+        except Exception as ex:
+            messagebox.showerror("Save Error", str(ex), parent=self)
 
     def _apply(self):
         if not self._result:
@@ -4673,6 +5000,1101 @@ class AnalyzerWindow(tk.Toplevel):
             parent=self)
         self.destroy()
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  LONG PATH LENGTH REPAIR TOOL
+# ═══════════════════════════════════════════════════════════════════════════
+
+class LongPathRepairWindow(tk.Toplevel):
+    """
+    Long Path Length Repair Tool.
+
+    Accepts problematic paths either via direct handoff from AnalyzerWindow
+    (path_stats dict) or by importing a saved analysis log file.
+
+    Layout
+    ------
+    Top bar  : Import from Log button, rename target length spinbox, stats label
+    Filter   : All / Warning / Critical / Pending radio buttons
+    Treeview : Status | Len | Directory | Filename | Ext  (+ scrollbars)
+    Edit panel : color-coded path display, editable stem entry, live length counter
+    Bottom bar : Save Rename Log | Undo Last | Apply Selected | Apply All | Close
+
+    Rename flow
+    -----------
+    1. Select a row  → edit panel populates with directory (blue), stem (editable), ext (grey)
+    2. Edit the stem  → live "New: [NNN]" length counter updates
+    3. Press Enter or click "Preview Edit"  → row marked ● Pending in treeview
+    4. Click "Apply This File" or "Apply All"  → os.rename() called, row becomes ✔ Applied
+    5. Undo Last  → reverses the most recent file or folder rename
+
+    Right-click on any row → context menu includes "Rename Parent Folder..."
+    which renames the deepest folder component in the path and cascades the
+    update to all affected rows.
+
+    Architecture notes
+    ------------------
+    - Self contained: no reference back to AnalyzerWindow
+    - Does NOT use grab_set() — floats freely alongside other windows
+    - Widget refs use _tv, _entry_stem, _lbl_new_length etc. (no _w)
+    - All tk calls from threads go through self.after() — but this window
+      has no worker threads; all operations are synchronous UI actions
+    """
+
+    WARN_LIMIT     = 200
+    CRIT_LIMIT     = 260
+    DEFAULT_TARGET = 190   # suggest renames to bring total path to this length
+
+    def __init__(self, parent, app, path_stats=None):
+        super().__init__(parent)
+        self.app        = app
+        self._c         = app._c
+        self._items     = {}    # iid -> item dict
+        self._undo_stack= []    # list of undo records
+        self._rename_log= []    # (iso_timestamp, old_path, new_path)
+        self._edit_iid  = None  # iid of currently selected/editing row
+        self._filter_var= tk.StringVar(value="all")
+        self._target_var= tk.IntVar(value=self.DEFAULT_TARGET)
+        self._inhibit_trace = False
+        self._sort_col  = "length"   # default sort: path length
+        self._sort_rev  = False      # ascending
+
+        self.title("Long Path Length Repair")
+        self.geometry("1160x780")
+        self.minsize(900, 620)
+        self.configure(bg=self._c["options"])
+
+        self._build_ui()
+        self._build_context_menu()
+
+        if path_stats:
+            self._load_from_path_stats(path_stats)
+
+    # ── UI construction ──────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        c   = self._c
+        BG  = c["options"]
+        FG  = c["fg"]
+        ENT = c["entry"]
+        pad = 8
+
+        # ── Top control bar ──────────────────────────────────────────────────
+        top = tk.Frame(self, bg=c["paths"], padx=pad, pady=pad)
+        top.pack(fill="x")
+
+        ttk.Button(top, text="\U0001f4c2 Import from Log",
+                   style="Browse.TButton",
+                   command=self._import_from_log).pack(side="left")
+
+        tk.Label(top, text="   Target length:",
+                 bg=c["paths"], fg=FG).pack(side="left")
+        ttk.Spinbox(top, from_=100, to=259, increment=5,
+                    textvariable=self._target_var,
+                    width=6).pack(side="left", padx=(4, 0))
+        tk.Label(top, text="chars  (used by Auto-Suggest)",
+                 bg=c["paths"], fg=FG,
+                 font=("Segoe UI", 8, "italic")).pack(side="left", padx=(4, 0))
+
+        self._var_stats = tk.StringVar(value="No paths loaded.")
+        tk.Label(top, textvariable=self._var_stats,
+                 bg=c["paths"], fg=FG,
+                 font=("Segoe UI", 9, "italic")).pack(side="right", padx=(0, 4))
+
+        # ── Filter bar ───────────────────────────────────────────────────────
+        fbar = tk.Frame(self, bg=BG, padx=pad, pady=4)
+        fbar.pack(fill="x")
+        tk.Label(fbar, text="Show:", bg=BG, fg=FG).pack(side="left")
+        for lbl, val in [("All", "all"),
+                         ("\u26a0 Warning", "warn"),
+                         ("\U0001f534 Critical", "crit"),
+                         ("\u25cf Pending", "pending")]:
+            tk.Radiobutton(fbar, text=lbl, variable=self._filter_var,
+                           value=val, bg=BG, fg=FG, activebackground=BG,
+                           selectcolor=ENT,
+                           command=self._populate_tree).pack(
+                               side="left", padx=(10, 0))
+
+        # ── Treeview ─────────────────────────────────────────────────────────
+        tv_wrap = tk.Frame(self, bg=BG, padx=pad)
+        tv_wrap.pack(fill="both", expand=True, pady=(2, 0))
+
+        cols = ("status", "length", "directory", "filename", "ext")
+        self._tv = ttk.Treeview(tv_wrap, columns=cols,
+                                show="headings", selectmode="extended")
+        self._tv.heading("status",    text="Status",         anchor="w")
+        self._tv.heading("length",    text="Len",            anchor="center")
+        self._tv.heading("directory", text="\U0001f4c1 Directory", anchor="w")
+        self._tv.heading("filename",  text="\u270f Filename", anchor="w")
+        self._tv.heading("ext",       text="Ext",            anchor="w")
+        self._tv.column("status",    width=95,  stretch=False,
+                         anchor="w",      minwidth=75)
+        self._tv.column("length",    width=62,  stretch=False,
+                         anchor="center", minwidth=55)
+        self._tv.column("directory", width=420, stretch=True,
+                         anchor="w",      minwidth=150)
+        self._tv.column("filename",  width=310, stretch=True,
+                         anchor="w",      minwidth=100)
+        self._tv.column("ext",       width=95,  stretch=False,
+                         anchor="w",      minwidth=50)
+
+        self._tv.tag_configure("crit",    background="#FFE0DD", foreground="#660000")
+        self._tv.tag_configure("warn",    background="#FFF8E0", foreground="#664400")
+        self._tv.tag_configure("pending", background="#E4EDFF", foreground="#001EA8")
+        self._tv.tag_configure("applied", background="#E0FFE6", foreground="#005500")
+        self._tv.tag_configure("error",   background="#FFD0D0", foreground="#990000")
+
+        tv_sby = ttk.Scrollbar(tv_wrap, orient="vertical",   command=self._tv.yview)
+        tv_sbx = ttk.Scrollbar(tv_wrap, orient="horizontal", command=self._tv.xview)
+        self._tv.configure(yscrollcommand=tv_sby.set, xscrollcommand=tv_sbx.set)
+        tv_sby.pack(side="right",  fill="y")
+        tv_sbx.pack(side="bottom", fill="x")
+        self._tv.pack(fill="both", expand=True)
+
+        self._tv.bind("<<TreeviewSelect>>", self._on_row_select)
+        self._tv.bind("<Button-3>",         self._on_right_click)
+
+        # Bind sort command to every column heading
+        for _sc in ("status", "length", "directory", "filename", "ext"):
+            self._tv.heading(_sc, command=lambda c=_sc: self._sort_by(c))
+        self._update_heading_indicators()    # show ▲ on default sort col
+
+        # ── Edit panel ───────────────────────────────────────────────────────
+        ep = tk.Frame(self, bg=c["header"], padx=pad, pady=7)
+        ep.pack(fill="x")
+        ep.columnconfigure(1, weight=1)
+
+        # Row 0: color-coded path preview
+        tk.Label(ep, text="Path:", bg=c["header"], fg=FG,
+                 font=("Segoe UI", 9, "bold")).grid(
+                     row=0, column=0, sticky="w", padx=(0, 6))
+
+        path_row = tk.Frame(ep, bg=c["header"])
+        path_row.grid(row=0, column=1, columnspan=2, sticky="ew")
+
+        self._var_dir_lbl = tk.StringVar(value="(select a row to edit)")
+        tk.Label(path_row, textvariable=self._var_dir_lbl,
+                 bg=c["header"], fg="#1A4A7A",
+                 font=("Consolas", 9)).pack(side="left")
+
+        self._var_stem_lbl = tk.StringVar(value="")
+        tk.Label(path_row, textvariable=self._var_stem_lbl,
+                 bg=c["header"], fg=FG,
+                 font=("Consolas", 9, "bold")).pack(side="left")
+
+        self._var_ext_lbl = tk.StringVar(value="")
+        tk.Label(path_row, textvariable=self._var_ext_lbl,
+                 bg=c["header"], fg="#777777",
+                 font=("Consolas", 9)).pack(side="left")
+
+        self._var_cur_len = tk.StringVar(value="")
+        tk.Label(ep, textvariable=self._var_cur_len,
+                 bg=c["header"], fg=FG,
+                 font=("Segoe UI", 9)).grid(
+                     row=0, column=3, sticky="e", padx=(8, 0))
+
+        # Row 1: stem entry + live counter
+        tk.Label(ep, text="Stem:", bg=c["header"], fg=FG).grid(
+            row=1, column=0, sticky="w", pady=(6, 0), padx=(0, 6))
+
+        self._var_stem = tk.StringVar()
+        self._var_stem.trace_add("write", self._on_stem_change)
+        self._entry_stem = ttk.Entry(ep, textvariable=self._var_stem, width=60)
+        self._entry_stem.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        self._entry_stem.bind("<Return>",   lambda e: self._preview_edit())
+        self._entry_stem.bind("<Escape>",   lambda e: self._clear_edit())
+        self._entry_stem.bind("<FocusOut>", lambda e: self._auto_save_if_dirty())
+
+        self._var_ext2 = tk.StringVar(value="")
+        tk.Label(ep, textvariable=self._var_ext2,
+                 bg=c["header"], fg="#777777",
+                 font=("Consolas", 9)).grid(
+                     row=1, column=2, sticky="w", pady=(6, 0), padx=(6, 0))
+
+        self._lbl_new_len = tk.Label(ep, text="New: \u2014",
+                                      bg=c["header"], fg=FG,
+                                      font=("Segoe UI", 9, "bold"))
+        self._lbl_new_len.grid(row=1, column=3, sticky="e", pady=(6, 0), padx=(8, 0))
+
+        # Row 2: action buttons
+        ab = tk.Frame(ep, bg=c["header"])
+        ab.grid(row=2, column=0, columnspan=4, sticky="w", pady=(7, 0))
+
+        self._btn_suggest = ttk.Button(
+            ab, text="\U0001f916 Auto-Suggest", style="Browse.TButton",
+            command=self._auto_suggest, state="disabled")
+        self._btn_suggest.pack(side="left")
+
+        self._btn_preview = ttk.Button(
+            ab, text="\U0001f441 Preview Edit", style="Preview.TButton",
+            command=self._preview_edit, state="disabled")
+        self._btn_preview.pack(side="left", padx=(8, 0))
+
+        self._btn_clear = ttk.Button(
+            ab, text="\u21a9 Clear Edit", style="Browse.TButton",
+            command=self._clear_edit, state="disabled")
+        self._btn_clear.pack(side="left", padx=(8, 0))
+
+        self._btn_rename_parent = ttk.Button(
+            ab, text="\U0001f4c1 Rename Parent Folder\u2026",
+            style="Browse.TButton",
+            command=self._rename_parent_folder, state="disabled")
+        self._btn_rename_parent.pack(side="left", padx=(8, 0))
+
+        self._btn_apply_this = ttk.Button(
+            ab, text="\u2714 Apply This File", style="Save.TButton",
+            command=self._apply_this, state="disabled")
+        self._btn_apply_this.pack(side="left", padx=(8, 0))
+
+        # ── Bottom button bar ─────────────────────────────────────────────────
+        bot = tk.Frame(self, bg=c["buttons"], padx=pad, pady=6)
+        bot.pack(fill="x")
+
+        self._btn_save_log = ttk.Button(
+            bot, text="\U0001f4be Save Rename Log", style="Save.TButton",
+            command=self._save_rename_log)
+        self._btn_save_log.pack(side="left")
+
+        self._btn_undo = ttk.Button(
+            bot, text="\u21a9 Undo Last", style="Browse.TButton",
+            command=self._undo_last, state="disabled")
+        self._btn_undo.pack(side="left", padx=(8, 0))
+
+        self._btn_apply_sel = ttk.Button(
+            bot, text="\u2714 Apply Selected", style="Start.TButton",
+            command=self._apply_selected)
+        self._btn_apply_sel.pack(side="left", padx=(8, 0))
+
+        self._btn_apply_all = ttk.Button(
+            bot, text="\u2714 Apply All", style="Start.TButton",
+            command=self._apply_all)
+        self._btn_apply_all.pack(side="left", padx=(8, 0))
+
+        ttk.Button(bot, text="Close", style="Browse.TButton",
+                   command=self.destroy).pack(side="right")
+
+    def _build_context_menu(self):
+        self._ctx = tk.Menu(self, tearoff=0)
+        self._ctx.add_command(
+            label="\U0001f4c2 Open Folder in Explorer",
+            command=self._open_folder)
+        self._ctx.add_separator()
+        self._ctx.add_command(
+            label="\u270f Edit Stem",
+            command=lambda: self._entry_stem.focus_set())
+        self._ctx.add_command(
+            label="\U0001f916 Auto-Suggest Filename",
+            command=self._auto_suggest)
+        self._ctx.add_separator()
+        self._ctx.add_command(
+            label="\U0001f4c1 Rename Parent Folder\u2026",
+            command=self._rename_parent_folder)
+        self._ctx.add_separator()
+        self._ctx.add_command(
+            label="\u2714 Apply This File",
+            command=self._apply_this)
+
+    # ── Data loading ─────────────────────────────────────────────────────────
+
+    def _make_item(self, idx, severity, plen, pstr):
+        """Build an item dict from a (severity, plen, pstr) tuple."""
+        fname    = os.path.basename(pstr)
+        dir_part = os.path.dirname(pstr)
+        stem, ext = _split_stem_ext(fname)
+        iid = "r_" + str(idx)
+        return {
+            "iid":          iid,
+            "orig_path":    pstr,
+            "current_path": pstr,
+            "dir_part":     dir_part,
+            "stem":         stem,
+            "ext":          ext,
+            "pending_stem": None,
+            "pending_path": None,
+            "status":       "ok",
+            "error_msg":    "",
+            "severity":     severity,
+            "orig_length":  plen,
+        }
+
+    def _load_from_path_stats(self, ps):
+        """Populate from a path_stats dict (direct handoff from AnalyzerWindow)."""
+        self._items.clear()
+        self._tv.delete(*self._tv.get_children())
+        idx = 0
+        for plen, pstr in ps.get("crit_paths", []):
+            item = self._make_item(idx, "crit", plen, pstr)
+            self._items[item["iid"]] = item
+            idx += 1
+        for plen, pstr in ps.get("warn_paths", []):
+            item = self._make_item(idx, "warn", plen, pstr)
+            self._items[item["iid"]] = item
+            idx += 1
+        self._populate_tree()
+        self._update_stats_label()
+
+    def _import_from_log(self):
+        """Parse a saved analysis log and load paths from it."""
+        log_path = filedialog.askopenfilename(
+            parent=self,
+            title="Import Analysis Log",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if not log_path:
+            return
+
+        pattern = re.compile(
+            r"^\[(Critical|Warning)\]\s+\((\d+)\s+chars\)\s+(.+)$")
+        entries = []
+        try:
+            with open(log_path, encoding="utf-8") as fh:
+                for line in fh:
+                    m = pattern.match(line.strip())
+                    if m:
+                        sev  = "crit" if m.group(1) == "Critical" else "warn"
+                        plen = int(m.group(2))
+                        pstr = m.group(3).strip()
+                        entries.append((sev, plen, pstr))
+        except Exception as ex:
+            messagebox.showerror("Import Error", str(ex), parent=self)
+            return
+
+        if not entries:
+            messagebox.showinfo(
+                "No Paths Found",
+                "No [Critical] or [Warning] paths found in this log.",
+                parent=self)
+            return
+
+        self._items.clear()
+        self._tv.delete(*self._tv.get_children())
+        for idx, (sev, plen, pstr) in enumerate(entries):
+            item = self._make_item(idx, sev, plen, pstr)
+            self._items[item["iid"]] = item
+
+        self._populate_tree()
+        self._update_stats_label()
+        messagebox.showinfo(
+            "Import Complete",
+            str(len(entries)) + " path(s) loaded from log.",
+            parent=self)
+
+    # ── Treeview population & row helpers ───────────────────────────────────
+
+    def _item_tag(self, item):
+        s = item["status"]
+        if s == "error":   return "error"
+        if s == "applied": return "applied"
+        if s == "pending": return "pending"
+        return item["severity"]   # "crit" or "warn"
+
+    def _item_values(self, item):
+        status_map = {
+            "ok":      "",
+            "pending": "\u25cf Pending",
+            "applied": "\u2714 Applied",
+            "error":   "\u2717 Error",
+        }
+        status_txt = status_map.get(item["status"], "")
+        # Length shown reflects any pending path if set, else current_path
+        display_path = item.get("pending_path") or item["current_path"]
+        length_txt   = "[" + str(len(display_path)) + "]"
+        stem_disp    = (item["pending_stem"]
+                        if item["pending_stem"] is not None
+                        else item["stem"])
+        return (status_txt, length_txt,
+                item["dir_part"], stem_disp, item["ext"])
+
+    def _populate_tree(self):
+        filt = self._filter_var.get()
+        self._tv.delete(*self._tv.get_children())
+        visible = [
+            item for item in self._items.values()
+            if not (filt == "warn"    and item["severity"] != "warn")
+            and not (filt == "crit"   and item["severity"] != "crit")
+            and not (filt == "pending" and item["status"]  != "pending")
+        ]
+        visible.sort(key=self._sort_key, reverse=self._sort_rev)
+        for item in visible:
+            self._tv.insert("", tk.END, iid=item["iid"],
+                            values=self._item_values(item),
+                            tags=(self._item_tag(item),))
+
+    def _sort_key(self, item):
+        col = self._sort_col
+        if col == "length":
+            p = item.get("pending_path") or item["current_path"]
+            return len(p)
+        if col == "status":
+            order = {"error": 0, "pending": 1, "ok": 2, "applied": 3}
+            return order.get(item["status"], 2)
+        if col == "directory":
+            return item["dir_part"].lower()
+        if col == "filename":
+            s = item["pending_stem"] if item["pending_stem"] else item["stem"]
+            return s.lower()
+        if col == "ext":
+            return item["ext"].lower()
+        return ""
+
+    def _sort_by(self, col):
+        if self._sort_col == col:
+            self._sort_rev = not self._sort_rev
+        else:
+            self._sort_col = col
+            self._sort_rev = False
+        self._update_heading_indicators()
+        self._populate_tree()
+
+    def _update_heading_indicators(self):
+        _base = {
+            "status":    "Status",
+            "length":    "Len",
+            "directory": "\U0001f4c1 Directory",
+            "filename":  "\u270f Filename",
+            "ext":       "Ext",
+        }
+        for col, label in _base.items():
+            if col == self._sort_col:
+                indicator = " \u25bc" if self._sort_rev else " \u25b2"
+            else:
+                indicator = ""
+            self._tv.heading(col, text=label + indicator)
+
+    def _refresh_row(self, iid):
+        """Refresh a single treeview row in-place (no-op if filtered out)."""
+        item = self._items.get(iid)
+        if item is None:
+            return
+        try:
+            self._tv.item(iid, values=self._item_values(item),
+                          tags=(self._item_tag(item),))
+        except tk.TclError:
+            pass   # row is filtered out
+
+    # ── Edit panel ───────────────────────────────────────────────────────────
+
+    def _on_row_select(self, event=None):
+        # Auto-save any unsaved stem edit before leaving the current row
+        self._auto_save_if_dirty()
+        sel = self._tv.selection()
+        if not sel:
+            self._edit_iid = None
+            self._update_edit_panel(None)
+            return
+        iid = sel[0]
+        self._edit_iid = iid
+        self._update_edit_panel(self._items.get(iid))
+
+    def _auto_save_if_dirty(self):
+        """
+        Silently mark the current row Pending if the stem entry has been
+        changed but not yet previewed.  No dialog shown — conflicts are
+        simply skipped (the user will see the row remain un-pending).
+        Called from FocusOut and from _on_row_select before switching rows.
+        """
+        iid = self._edit_iid
+        if not iid:
+            return
+        item = self._items.get(iid)
+        if item is None:
+            return
+        entry_val = self._var_stem.get().strip()
+        if not entry_val:
+            return
+        # "expected" is whatever the item currently reflects
+        expected = (item["pending_stem"] if item["pending_stem"] is not None
+                    else item["stem"])
+        if entry_val == expected:
+            return   # nothing changed — leave it alone
+        new_filename = entry_val + item["ext"]
+        new_path     = os.path.join(item["dir_part"], new_filename)
+        if self._conflict_exists(iid, item["dir_part"], new_filename):
+            return   # skip silently; user will see the discrepancy
+        item["pending_stem"] = entry_val
+        item["pending_path"] = new_path
+        item["status"]       = "pending"
+        self._refresh_row(iid)
+        self._update_stats_label()
+
+    def _on_right_click(self, event):
+        iid = self._tv.identify_row(event.y)
+        if iid:
+            self._tv.selection_set(iid)
+            self._on_row_select()
+        self._ctx.tk_popup(event.x_root, event.y_root)
+
+    def _update_edit_panel(self, item):
+        """Refresh all edit-panel widgets for the given item (or None to clear)."""
+        if item is None:
+            self._var_dir_lbl.set("(select a row to edit)")
+            self._var_stem_lbl.set("")
+            self._var_ext_lbl.set("")
+            self._var_ext2.set("")
+            self._var_cur_len.set("")
+            self._lbl_new_len.configure(
+                text="New: \u2014", foreground=self._c["fg"])
+            for btn in (self._btn_suggest, self._btn_preview,
+                        self._btn_clear, self._btn_rename_parent,
+                        self._btn_apply_this):
+                btn.configure(state="disabled")
+            return
+
+        dir_display = item["dir_part"]
+        if not dir_display.endswith(("\\", "/")):
+            dir_display += os.sep
+        stem = (item["pending_stem"] if item["pending_stem"] is not None
+                else item["stem"])
+        ext  = item["ext"]
+
+        self._var_dir_lbl.set(dir_display)
+        self._var_ext_lbl.set(ext)
+        self._var_ext2.set(ext + "  \u2014 locked")
+        self._var_cur_len.set(
+            "Current: [" + str(len(item["current_path"])) + "]")
+
+        # Update stem entry (suppress trace feedback loop)
+        self._inhibit_trace = True
+        self._var_stem.set(stem)
+        self._var_stem_lbl.set(stem)
+        self._inhibit_trace = False
+
+        # Manually trigger length display for the loaded stem
+        self._compute_new_length(item, stem)
+
+        for btn in (self._btn_suggest, self._btn_preview,
+                    self._btn_clear, self._btn_rename_parent):
+            btn.configure(state="normal")
+        self._btn_apply_this.configure(
+            state="normal" if item["status"] == "pending" else "disabled")
+
+    def _on_stem_change(self, *args):
+        """Trace callback — fires on every keystroke in the stem entry."""
+        if self._inhibit_trace:
+            return
+        iid = self._edit_iid
+        if not iid:
+            return
+        item = self._items.get(iid)
+        if item is None:
+            return
+        new_stem = self._var_stem.get()
+        # Keep the colour-coded stem label in sync
+        self._var_stem_lbl.set(new_stem)
+        self._compute_new_length(item, new_stem)
+
+    def _compute_new_length(self, item, stem):
+        """Update the live "New: [NNN]" label for the given stem."""
+        new_path = os.path.join(item["dir_part"], stem + item["ext"])
+        n = len(new_path)
+        if n >= self.CRIT_LIMIT:
+            colour = "#CC0000"
+            label  = "New: [" + str(n) + "] CRITICAL"
+        elif n >= self.WARN_LIMIT:
+            colour = "#8A5A00"
+            label  = "New: [" + str(n) + "] Warning"
+        else:
+            colour = "#1A7A30"
+            label  = "New: [" + str(n) + "] OK \u2713"
+        self._lbl_new_len.configure(text=label, foreground=colour)
+
+    # ── Edit actions ─────────────────────────────────────────────────────────
+
+    def _preview_edit(self):
+        """Mark the current row as Pending with the edited stem."""
+        iid = self._edit_iid
+        if not iid:
+            return
+        item     = self._items[iid]
+        new_stem = self._var_stem.get().strip()
+        if not new_stem:
+            messagebox.showwarning(
+                "Empty Stem",
+                "The filename stem cannot be empty.", parent=self)
+            return
+        new_filename = new_stem + item["ext"]
+        new_path     = os.path.join(item["dir_part"], new_filename)
+        # Conflict check
+        if self._conflict_exists(iid, item["dir_part"], new_filename):
+            messagebox.showwarning(
+                "Name Conflict",
+                "'" + new_filename + "' is already in use by another "
+                "pending rename in the same directory.",
+                parent=self)
+            return
+        item["pending_stem"] = new_stem
+        item["pending_path"] = new_path
+        item["status"]       = "pending"
+        self._refresh_row(iid)
+        self._btn_apply_this.configure(state="normal")
+        self._update_stats_label()
+
+    def _clear_edit(self):
+        """Discard pending edits on ALL currently selected rows."""
+        sel = self._tv.selection()
+        targets = list(sel) if sel else (
+            [self._edit_iid] if self._edit_iid else [])
+        if not targets:
+            return
+        for iid in targets:
+            item = self._items.get(iid)
+            if item is None:
+                continue
+            item["pending_stem"] = None
+            item["pending_path"] = None
+            if item["status"] in ("pending", "error"):
+                item["status"]    = "ok"
+                item["error_msg"] = ""
+            self._refresh_row(iid)
+        # Refresh the edit panel for the primary selection
+        if self._edit_iid and self._edit_iid in targets:
+            item = self._items.get(self._edit_iid)
+            if item:
+                self._inhibit_trace = True
+                self._var_stem.set(item["stem"])
+                self._var_stem_lbl.set(item["stem"])
+                self._inhibit_trace = False
+                self._compute_new_length(item, item["stem"])
+                self._btn_apply_this.configure(state="disabled")
+        self._update_stats_label()
+
+    def _auto_suggest(self):
+        """
+        Apply smart stem-shortening to ALL selected rows.
+        Single-row behaviour: also updates the edit panel immediately.
+        Multi-row behaviour: marks all qualifying rows as Pending and
+        shows a summary.  Rows where the directory alone exceeds the target
+        are skipped and reported.
+        """
+        sel = self._tv.selection()
+        targets = list(sel) if sel else (
+            [self._edit_iid] if self._edit_iid else [])
+        if not targets:
+            return
+        target   = self._target_var.get()
+        modified = 0
+        no_change= 0
+        dir_too_long = 0
+
+        for iid in targets:
+            item = self._items.get(iid)
+            if item is None or item["status"] == "applied":
+                continue
+            result = self._compute_suggestion(item, target)
+            if result is None:
+                # Distinguish "dir too long" from "already short enough"
+                dir_len = len(item["dir_part"]) + 1 + len(item["ext"])
+                if target - dir_len <= 0:
+                    dir_too_long += 1
+                else:
+                    no_change += 1
+                continue
+            item["pending_stem"] = result
+            item["pending_path"] = os.path.join(
+                item["dir_part"], result + item["ext"])
+            item["status"] = "pending"
+            self._refresh_row(iid)
+            modified += 1
+
+        # Sync edit panel for the primary selection
+        if self._edit_iid and self._edit_iid in targets:
+            primary = self._items.get(self._edit_iid)
+            if primary:
+                stem = (primary["pending_stem"] if primary["pending_stem"] is not None
+                        else primary["stem"])
+                self._inhibit_trace = True
+                self._var_stem.set(stem)
+                self._var_stem_lbl.set(stem)
+                self._inhibit_trace = False
+                self._compute_new_length(primary, stem)
+                self._btn_apply_this.configure(
+                    state="normal" if primary["status"] == "pending" else "disabled")
+
+        self._update_stats_label()
+
+        if len(targets) == 1:
+            # Single-row: quiet — the panel shows the result inline
+            if dir_too_long:
+                messagebox.showwarning(
+                    "Cannot Auto-Suggest",
+                    "The directory path alone already meets or exceeds the "
+                    "target of " + str(target) + " chars.\n\n"
+                    "Rename or relocate the parent folder to fix this.",
+                    parent=self)
+            elif no_change:
+                messagebox.showinfo(
+                    "Already Within Target",
+                    "The stem is already within the target length.",
+                    parent=self)
+        else:
+            # Multi-row: show summary
+            parts = [str(modified) + " filename(s) set to Pending."]
+            if no_change:
+                parts.append(str(no_change) + " already within target.")
+            if dir_too_long:
+                parts.append(str(dir_too_long) + " skipped — directory "
+                             "path alone exceeds target (folder rename needed).")
+            messagebox.showinfo("Auto-Suggest Complete",
+                                "\n".join(parts), parent=self)
+
+    def _compute_suggestion(self, item, target):
+        """
+        Compute a shortened stem for item to bring total path <= target chars.
+        Returns the new stem string, or None if no shortening is possible/needed.
+        Strategy: strip whitespace → collapse spaces → remove trailing
+        parenthetical/bracketed ROM tokens → hard-truncate.
+        """
+        dir_len = len(item["dir_part"]) + 1   # +1 for os.sep
+        ext_len = len(item["ext"])
+        avail   = target - dir_len - ext_len
+        if avail <= 0:
+            return None
+        stem = item["stem"].strip()
+        stem = re.sub(r"  +", " ", stem)
+        while len(stem) > avail:
+            trimmed = re.sub(
+                r"\s*[\(\[][^\)\]]{1,80}[\)\]]\s*$", "", stem).rstrip()
+            if not trimmed or trimmed == stem:
+                break
+            stem = trimmed
+        if len(stem) > avail:
+            stem = stem[:avail].rstrip()
+        return stem if stem != item["stem"] else None
+
+    # ── Apply / undo ─────────────────────────────────────────────────────────
+
+    def _conflict_exists(self, this_iid, dir_part, new_filename):
+        """True if new_filename in dir_part clashes with another pending rename."""
+        nl = new_filename.lower()
+        dl = dir_part.lower()
+        for iid, item in self._items.items():
+            if iid == this_iid:
+                continue
+            if item["dir_part"].lower() != dl:
+                continue
+            if item["status"] == "pending" and item["pending_stem"]:
+                other = (item["pending_stem"] + item["ext"]).lower()
+                if other == nl:
+                    return True
+        return False
+
+    def _apply_this(self):
+        iid = self._edit_iid
+        if not iid:
+            sel = self._tv.selection()
+            if sel:
+                iid = sel[0]
+        if not iid:
+            return
+        item = self._items.get(iid)
+        if item is None or item["status"] != "pending":
+            messagebox.showinfo(
+                "No Pending Edit",
+                "The selected item has no pending rename to apply.",
+                parent=self)
+            return
+        self._do_apply([iid])
+
+    def _apply_selected(self):
+        iids = [iid for iid in self._tv.selection()
+                if self._items.get(iid, {}).get("status") == "pending"]
+        if not iids:
+            messagebox.showinfo(
+                "Nothing Selected",
+                "No pending renames among the selected rows.",
+                parent=self)
+            return
+        self._do_apply(iids)
+
+    def _apply_all(self):
+        iids = [iid for iid, it in self._items.items()
+                if it["status"] == "pending"]
+        if not iids:
+            messagebox.showinfo(
+                "Nothing to Apply",
+                "No pending renames found.", parent=self)
+            return
+        self._do_apply(iids)
+
+    def _do_apply(self, iids):
+        applied = 0
+        errors  = 0
+        for iid in iids:
+            item = self._items[iid]
+            if item["status"] != "pending":
+                continue
+            old_path     = item["current_path"]
+            new_filename = item["pending_stem"] + item["ext"]
+            new_path     = os.path.join(item["dir_part"], new_filename)
+            try:
+                os.rename(old_path, new_path)
+                self._undo_stack.append({
+                    "type":     "file",
+                    "old_path": old_path,
+                    "new_path": new_path,
+                    "iid":      iid,
+                })
+                ts = datetime.datetime.now().isoformat(timespec="seconds")
+                self._rename_log.append((ts, old_path, new_path))
+                item["current_path"] = new_path
+                item["stem"]         = item["pending_stem"]
+                item["pending_stem"] = None
+                item["pending_path"] = None
+                item["status"]       = "applied"
+                applied += 1
+            except Exception as ex:
+                item["status"]    = "error"
+                item["error_msg"] = str(ex)
+                errors += 1
+            self._refresh_row(iid)
+        # Refresh edit panel if the current selection was in this batch
+        if self._edit_iid in iids:
+            self._update_edit_panel(self._items.get(self._edit_iid))
+        self._update_stats_label()
+        self._update_undo_btn()
+        msg = str(applied) + " rename(s) applied."
+        if errors:
+            msg += "\n" + str(errors) + " error(s) — see list for details."
+            messagebox.showwarning("Apply Complete", msg, parent=self)
+        else:
+            messagebox.showinfo("Apply Complete", msg, parent=self)
+
+    def _undo_last(self):
+        if not self._undo_stack:
+            return
+        rec = self._undo_stack[-1]
+        try:
+            if rec["type"] == "file":
+                os.rename(rec["new_path"], rec["old_path"])
+                iid  = rec["iid"]
+                item = self._items.get(iid)
+                if item:
+                    fname            = os.path.basename(rec["old_path"])
+                    stem, _          = _split_stem_ext(fname)
+                    item["current_path"] = rec["old_path"]
+                    item["stem"]         = stem
+                    item["pending_stem"] = None
+                    item["pending_path"] = None
+                    item["status"]       = "ok"
+                    item["error_msg"]    = ""
+                    self._refresh_row(iid)
+                    if self._edit_iid == iid:
+                        self._update_edit_panel(item)
+
+            elif rec["type"] == "folder":
+                os.rename(rec["new_dir"], rec["old_dir"])
+                new_d = rec["new_dir"]
+                old_d = rec["old_dir"]
+                for aiid in rec["affected_iids"]:
+                    aitem = self._items.get(aiid)
+                    if aitem is None:
+                        continue
+                    if aitem["current_path"].startswith(new_d):
+                        aitem["current_path"] = (
+                            old_d + aitem["current_path"][len(new_d):])
+                    if aitem["dir_part"] == new_d:
+                        aitem["dir_part"] = old_d
+                    elif aitem["dir_part"].startswith(new_d + os.sep):
+                        aitem["dir_part"] = (
+                            old_d + aitem["dir_part"][len(new_d):])
+                    aitem["status"] = "ok"
+                    self._refresh_row(aiid)
+                if self._edit_iid in rec["affected_iids"]:
+                    self._update_edit_panel(
+                        self._items.get(self._edit_iid))
+
+            self._undo_stack.pop()
+            self._update_stats_label()
+            self._update_undo_btn()
+
+        except Exception as ex:
+            messagebox.showerror("Undo Error", str(ex), parent=self)
+
+    # ── Rename parent folder ─────────────────────────────────────────────────
+
+    def _rename_parent_folder(self):
+        iid = self._edit_iid
+        if not iid:
+            sel = self._tv.selection()
+            if sel:
+                iid = sel[0]
+        if not iid:
+            messagebox.showinfo(
+                "No Row Selected",
+                "Select a row first, then use Rename Parent Folder.",
+                parent=self)
+            return
+        item         = self._items[iid]
+        old_dir      = item["dir_part"]
+        folder_name  = os.path.basename(old_dir)
+        parent_of    = os.path.dirname(old_dir)
+
+        from tkinter import simpledialog
+        new_name = simpledialog.askstring(
+            "Rename Parent Folder",
+            "Renaming folder:\n  " + folder_name
+            + "\n\nNew name:",
+            initialvalue=folder_name,
+            parent=self)
+        if not new_name:
+            return
+        new_name = new_name.strip()
+        if new_name == folder_name:
+            return
+        new_dir = os.path.join(parent_of, new_name)
+        if os.path.exists(new_dir):
+            messagebox.showerror(
+                "Name Conflict",
+                "A folder named '" + new_name + "' already exists at that location.",
+                parent=self)
+            return
+
+        # Find every item whose dir_part sits inside old_dir
+        affected = [
+            i for i, it in self._items.items()
+            if it["dir_part"] == old_dir
+            or it["dir_part"].startswith(old_dir + os.sep)]
+
+        try:
+            os.rename(old_dir, new_dir)
+        except Exception as ex:
+            messagebox.showerror("Rename Error", str(ex), parent=self)
+            return
+
+        ts = datetime.datetime.now().isoformat(timespec="seconds")
+        self._rename_log.append((ts, old_dir, new_dir))
+        self._undo_stack.append({
+            "type":          "folder",
+            "old_dir":       old_dir,
+            "new_dir":       new_dir,
+            "affected_iids": affected,
+        })
+
+        for aiid in affected:
+            aitem = self._items[aiid]
+            if aitem["current_path"].startswith(old_dir):
+                aitem["current_path"] = (
+                    new_dir + aitem["current_path"][len(old_dir):])
+            if aitem["dir_part"] == old_dir:
+                aitem["dir_part"] = new_dir
+            elif aitem["dir_part"].startswith(old_dir + os.sep):
+                aitem["dir_part"] = (
+                    new_dir + aitem["dir_part"][len(old_dir):])
+            self._refresh_row(aiid)
+
+        self._update_stats_label()
+        self._update_undo_btn()
+        if self._edit_iid in affected:
+            self._update_edit_panel(self._items[self._edit_iid])
+
+        messagebox.showinfo(
+            "Folder Renamed",
+            "Renamed to:\n  " + new_dir + "\n\n"
+            + str(len(affected)) + " path(s) updated in the list.\n\n"
+            "Tip: re-run the Folder Structure Analyzer to get a fresh "
+            "path length picture after folder renames.",
+            parent=self)
+
+    # ── Open folder in Explorer ──────────────────────────────────────────────
+
+    def _open_folder(self):
+        """
+        Open Windows Explorer at the folder containing the right-clicked path.
+        Uses /select, to also highlight the file itself when it still exists.
+        Falls back to opening the directory only if the file is gone.
+        """
+        iid = self._edit_iid
+        if not iid:
+            sel = self._tv.selection()
+            if sel:
+                iid = sel[0]
+        if not iid:
+            messagebox.showinfo(
+                "No Row Selected",
+                "Select a row first.", parent=self)
+            return
+        item     = self._items[iid]
+        cur_path = os.path.normpath(item["current_path"])
+        dir_part = os.path.normpath(item["dir_part"])
+        try:
+            if os.path.isfile(cur_path):
+                # Open Explorer with the file highlighted
+                subprocess.Popen(
+                    ["explorer", "/select,", cur_path])
+            elif os.path.isdir(dir_part):
+                subprocess.Popen(["explorer", dir_part])
+            else:
+                messagebox.showwarning(
+                    "Folder Not Found",
+                    "Neither the file nor its parent folder could be found:\n"
+                    + dir_part, parent=self)
+        except Exception as ex:
+            messagebox.showerror("Open Error", str(ex), parent=self)
+
+    # ── Save rename log ──────────────────────────────────────────────────────
+
+    def _save_rename_log(self):
+        if not self._rename_log:
+            messagebox.showinfo(
+                "No Renames Yet",
+                "No renames have been applied in this session.", parent=self)
+            return
+        default = ("rename_log_"
+                   + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".txt")
+        out = filedialog.asksaveasfilename(
+            parent=self,
+            title="Save Rename Log",
+            defaultextension=".txt",
+            initialfile=default,
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if not out:
+            return
+        lines = [
+            "Eggman's Datfile Creator Suite \u2014 Path Repair Rename Log",
+            "Generated  : " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "",
+            "=" * 72,
+            str(len(self._rename_log)) + " rename(s) recorded:",
+            "=" * 72,
+            "",
+        ]
+        for ts, old_p, new_p in self._rename_log:
+            lines += [
+                "[" + ts + "]",
+                "  OLD: " + old_p,
+                "  NEW: " + new_p,
+                "",
+            ]
+        try:
+            with open(out, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines))
+            messagebox.showinfo(
+                "Log Saved", "Rename log saved to:\n" + out, parent=self)
+        except Exception as ex:
+            messagebox.showerror("Save Error", str(ex), parent=self)
+
+    # ── Status helpers ───────────────────────────────────────────────────────
+
+    def _update_stats_label(self):
+        total   = len(self._items)
+        warns   = sum(1 for it in self._items.values() if it["severity"] == "warn")
+        crits   = sum(1 for it in self._items.values() if it["severity"] == "crit")
+        pending = sum(1 for it in self._items.values() if it["status"] == "pending")
+        applied = sum(1 for it in self._items.values() if it["status"] == "applied")
+        errors  = sum(1 for it in self._items.values() if it["status"] == "error")
+        parts = [
+            "Total: " + str(total),
+            "Warning: " + str(warns),
+            "Critical: " + str(crits),
+        ]
+        if pending: parts.append("Pending: " + str(pending))
+        if applied: parts.append("Applied: " + str(applied))
+        if errors:  parts.append("Errors: " + str(errors))
+        self._var_stats.set("  \u2014  ".join(parts))
+
+    def _update_undo_btn(self):
+        self._btn_undo.configure(
+            state="normal" if self._undo_stack else "disabled")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
